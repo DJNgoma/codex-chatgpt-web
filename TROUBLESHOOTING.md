@@ -65,9 +65,11 @@ window does not automatically transfer that session.
   running.
 - If the account offers **Try another way**, an alternate authentication method can avoid a
   platform-passkey limitation.
-- Passkey-only macOS accounts have a known open issue: [#209](https://github.com/miuuyy/codex-chatgpt-web/issues/209).
-  If no alternate method exists, follow that issue rather than repeatedly deleting the browser
-  profile; there is no safe generic workaround to claim yet.
+- On macOS, **Passkey sign in** opens Google Chrome for the passkey and imports only the resulting
+  ChatGPT session. It can be pressed while the ordinary embedded login is still waiting: the
+  embedded login hands over instead of holding sign-in until its own timeout.
+- Passkey-only macOS accounts were previously blocked by [#209](https://github.com/miuuyy/codex-chatgpt-web/issues/209).
+  Deleting the browser profile repeatedly does not help; use **Passkey sign in** instead.
 
 If an ordinary login still fails, export a safe log immediately after one attempt. Include the OS,
 launcher version, account tier, sign-in provider, and whether the Temporary Chat composer ever
