@@ -616,7 +616,9 @@ describe("reversible native Codex route integration", () => {
     ].join("\n");
     writeFileSync(configPath, original);
 
-    installCodexIntegration(nativeConfig("full"));
+    // A catalog-driven bridge already owns the picker, so installing over it is opt-in; what this
+    // covers is that opting in still leaves both of its keys untouched.
+    installCodexIntegration(nativeConfig("full"), { replaceExistingRoute: true });
     const userEdited = readFileSync(configPath, "utf8")
       .replace('model_provider = "first-provider"', 'model_provider = "second-provider"')
       .replace('model_catalog_json = "/tmp/first.json"', 'model_catalog_json = "/tmp/second.json"')
@@ -629,6 +631,24 @@ describe("reversible native Codex route integration", () => {
     expect(restored).toContain('model_provider = "second-provider"');
     expect(restored).toContain('model_catalog_json = "/tmp/second.json"');
     expect(restored).toContain("multi_agent = false");
+  });
+
+  test("refuses by default when another local bridge's catalog owns the model picker", () => {
+    const { codexHome } = fixture();
+    const configPath = join(codexHome, "config.toml");
+    const original = [
+      'model = "claude-opus"',
+      'model_provider = "local_model_bridge"',
+      'model_catalog_json = "/Users/example/.codex/local-bridge/model-catalog.json"',
+      "",
+    ].join("\n");
+    writeFileSync(configPath, original);
+
+    // Codex reads the picker from that catalog, so this route would install but list nothing.
+    expect(() => preflightCodexIntegration(nativeConfig("full"))).toThrow(/another local bridge/);
+    expect(() => installCodexIntegration(nativeConfig("full"))).toThrow(/model_catalog_json/);
+    expect(readFileSync(configPath, "utf8")).toBe(original);
+    expect(inspectCodexIntegration().installed).toBe(false);
   });
 
   test("preflight detects route conflicts without changing Codex or creating a journal", () => {

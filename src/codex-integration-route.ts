@@ -246,6 +246,29 @@ export function installRoute(
       + "Check whether another Codex extension or wrapper (for example, OpenCodex or Headroom) is replacing the bridge port.",
     );
   }
+  // A catalog-driven local bridge owns the model picker through `model_catalog_json`, so this
+  // route would be installed but never listed: Codex reads the picker from that catalog, not from
+  // `openai_base_url`. Installing silently on top of one leaves the user with a mutated Codex
+  // config and no visible ChatGPT Web models, so name the owner and fail closed instead. Only the
+  // first install reaches this guard; a managed journal already replaces its own route.
+  // `model_provider` alone is not evidence of one: it names the built-in provider on an ordinary
+  // Codex install. Only `model_catalog_json` replaces the picker's source.
+  const foreignCatalogRoute = previous.model_catalog_json.present
+    ? [
+        `model_catalog_json=${JSON.stringify(previous.model_catalog_json.value)}`,
+        ...(previous.model_provider.present
+          ? [`model_provider=${JSON.stringify(previous.model_provider.value)}`]
+          : []),
+      ]
+    : [];
+  if (foreignCatalogRoute.length > 0 && !replaceExistingRoute) {
+    throw new Error(
+      `Codex already routes its model picker through another local bridge (${foreignCatalogRoute.join(", ")}). `
+      + "That catalog owns the picker, so models installed here would not appear in it. "
+      + "Add the ChatGPT Web models to that bridge's catalog and let it proxy this launcher, "
+      + "or rerun with --replace-codex-route to install anyway; `codex-chatgpt-web uninstall` restores the prior values.",
+    );
+  }
   const previousRealtimeWebrtcCallBaseUrl = findTopLevelAssignment(
     document.lines,
     "experimental_realtime_webrtc_call_base_url",
