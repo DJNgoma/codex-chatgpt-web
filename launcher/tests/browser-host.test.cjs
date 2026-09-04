@@ -910,6 +910,49 @@ test("the authentication wait is released as soon as a passkey sign-in supersede
   assert.equal(probes, 1);
 });
 
+test("an incomplete sign-in names the missing proof once per distinct state", async () => {
+  const logged = [];
+  const contents = {
+    isDestroyed: () => false,
+    getURL: () => "https://chatgpt.com/c/8f2c1d3e-secret",
+    executeJavaScript: async () => surface,
+  };
+  let surface = {
+    url: "https://chatgpt.com/c/8f2c1d3e-secret?token=private",
+    composer: false,
+    temporary: false,
+    sessionAuthenticated: true,
+    readyState: "complete",
+  };
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    view: { webContents: contents },
+    authView: null,
+    turnTabs: new Map(),
+    manualOperation: "ChatGPT passkey login",
+    state: { authenticated: false },
+    lastAuthenticationGap: null,
+    setState(patch) { Object.assign(fixture.state, patch); },
+    snapshot: () => ({ ...fixture.state }),
+    logger: { info: (event, detail) => logged.push([event, detail]) },
+  });
+
+  await BrowserHost.prototype.probeAuthentication.call(fixture);
+  await BrowserHost.prototype.probeAuthentication.call(fixture);
+
+  const gaps = logged.filter(([event]) => event === "browser.authentication_incomplete");
+  assert.equal(gaps.length, 1, "an unchanged gap is logged once, not once per poll");
+  assert.deepEqual(gaps[0][1].missing, ["composer", "temporary-chat"]);
+  assert.equal(gaps[0][1].operation, "ChatGPT passkey login");
+  // The surface label keeps the origin and shape but never a conversation id or query value.
+  assert.equal(gaps[0][1].surface, "https://chatgpt.com/c/:id");
+
+  surface = { ...surface, sessionAuthenticated: false };
+  await BrowserHost.prototype.probeAuthentication.call(fixture);
+  const changed = logged.filter(([event]) => event === "browser.authentication_incomplete");
+  assert.equal(changed.length, 2, "a changed gap is logged again");
+  assert.deepEqual(changed[1][1].missing, ["composer", "temporary-chat", "server-session"]);
+});
+
 test("explicit login waits for an in-flight saved-session refresh before taking browser ownership", async () => {
   const calls = [];
   let finishRefresh;

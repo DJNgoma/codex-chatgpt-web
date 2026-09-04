@@ -149,6 +149,22 @@ function navigationOriginForLog(value) {
   }
 }
 
+// Sign-in proof needs a composer, a Temporary Chat URL and a server session all at once. Reporting
+// which one is missing needs a surface label that carries no query string, token or conversation id.
+function authenticationSurfaceForLog(value) {
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return parsed.protocol;
+    const pathname = parsed.pathname
+      .replace(/^\/c\/[^/]+/, "/c/:id")
+      .replace(/^\/g\/[^/]+/, "/g/:id")
+      .replace(/^\/share\/[^/]+/, "/share/:id");
+    return `${parsed.origin}${pathname}`;
+  } catch {
+    return "invalid-url";
+  }
+}
+
 function navigationErrorForLog(error) {
   if (!error || typeof error !== "object") return { errorType: typeof error };
   const detail = {
@@ -362,6 +378,7 @@ class BrowserHost {
     this.loginOperation = null;
     this.loginKind = null;
     this.loginSuperseded = false;
+    this.lastAuthenticationGap = null;
     this.sessionRefreshOperation = null;
     this.cloudflareChallengeRecovery = null;
     this.cloudflareChallengeRecoveryArmed = true;
@@ -2675,6 +2692,7 @@ class BrowserHost {
       if (this.authView && !this.authView.webContents.isDestroyed()) {
         this.closeAuthView(this.authView, true, false);
       }
+      this.lastAuthenticationGap = null;
       const wasAuthenticated = this.state.authenticated;
       const availability = this.activeTraceId
         ? { status: "running", message: "ChatGPT is working" }
@@ -2685,6 +2703,25 @@ class BrowserHost {
       if (!wasAuthenticated) this.logger.info("browser.authenticated", { url: result.url });
     } else {
       const loaded = result.readyState === "complete";
+      // Without this, every stalled sign-in and every failed passkey import looks like one generic
+      // timeout. The probe already knows which condition is missing; log it once per distinct
+      // state so a 60s or 180s wait leaves evidence instead of a single closing error.
+      const missing = [
+        result.composer ? null : "composer",
+        result.temporary ? null : "temporary-chat",
+        result.sessionAuthenticated ? null : "server-session",
+      ].filter(entry => entry !== null);
+      const surface = authenticationSurfaceForLog(result.url || url);
+      const gap = `${missing.join(",")}|${result.readyState}|${surface}`;
+      if (gap !== this.lastAuthenticationGap) {
+        this.lastAuthenticationGap = gap;
+        this.logger.info("browser.authentication_incomplete", {
+          missing,
+          readyState: result.readyState,
+          surface,
+          ...(this.manualOperation ? { operation: this.manualOperation } : {}),
+        });
+      }
       this.setState({
         status: loaded ? "signed-out" : "loading",
         message: loaded ? "Sign in to ChatGPT" : "Waiting for ChatGPT",
