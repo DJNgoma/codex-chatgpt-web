@@ -2437,8 +2437,16 @@ class BrowserHost {
           loading: true,
         });
         this.logger.info("browser.passkey_login_started");
-        const transfer = await this.loginWithPasskey();
-        return await this.installPasskeyLogin(transfer);
+        // Chrome takes focus the moment it opens, and the only instructions for the handoff plus
+        // the Continue button that ends it live in this window. Float it so the remaining steps
+        // stay readable beside Chrome instead of disappearing behind it.
+        this.setPasskeyHandoffFloating(true);
+        try {
+          const transfer = await this.loginWithPasskey();
+          return await this.installPasskeyLogin(transfer);
+        } finally {
+          this.setPasskeyHandoffFloating(false);
+        }
       });
     })();
     const tracked = operation.finally(() => {
@@ -2451,6 +2459,28 @@ class BrowserHost {
     this.loginOperation = tracked;
     this.loginKind = "passkey";
     return tracked;
+  }
+
+  setPasskeyHandoffFloating(floating) {
+    const window = this.window;
+    if (!window || typeof window.setAlwaysOnTop !== "function") return;
+    if (typeof window.isDestroyed === "function" && window.isDestroyed()) return;
+    try {
+      window.setAlwaysOnTop(floating, "floating");
+      // showInactive leaves the passkey prompt in Chrome focused while this window stays visible.
+      if (floating
+        && typeof window.showInactive === "function"
+        && typeof window.isVisible === "function"
+        && !window.isVisible()) {
+        window.showInactive();
+      }
+    } catch (error) {
+      // Staying in front is a convenience; never fail a sign-in because the window manager said no.
+      this.logger.warn("browser.passkey_float_failed", {
+        floating,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   async clearOwnedSessionForPasskey() {
