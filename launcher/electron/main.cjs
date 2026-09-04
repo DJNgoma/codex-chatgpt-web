@@ -18,6 +18,7 @@ const {
 const { BrowserHost, navigationErrorForLog } = require("./browser-host.cjs");
 const { BrowserControlServer } = require("./control-server.cjs");
 const { getAutostart, setAutostart } = require("./autostart.cjs");
+const { codexUsesExternalModelCatalog } = require("./codex-catalog-route.cjs");
 const {
   createLogger,
   exportSanitizedLogs,
@@ -134,15 +135,21 @@ function startCatalogVerificationMonitor({ logger, stateStore }) {
     try {
       const config = runtimeSupervisor.readConfig();
       const health = await runtimeSupervisor.proxyHealthPayload(config);
-      if (!Number.isInteger(health?.successful_model_catalog_requests)
-        || health.successful_model_catalog_requests < 1) return;
+      const served = Number.isInteger(health?.successful_model_catalog_requests)
+        && health.successful_model_catalog_requests >= 1;
+      // Prefer the real signal; fall back only when it provably cannot arrive, and
+      // record which path proved it so the two are never confused in the log.
+      const codexHome = process.env.CODEX_HOME?.trim() || path.join(app.getPath("home"), ".codex");
+      const externalCatalog = !served && codexUsesExternalModelCatalog(codexHome);
+      if (!served && !externalCatalog) return;
       const state = stateStore.update({
         codexCatalogVerified: true,
         codexRestartRequired: false,
       });
       logger.info("codex.model_catalog_verified", {
-        requests: health.successful_model_catalog_requests,
-        at: health.last_successful_model_catalog_request_at,
+        verifiedBy: served ? "codex-request" : "external-model-catalog",
+        requests: health?.successful_model_catalog_requests ?? 0,
+        at: health?.last_successful_model_catalog_request_at ?? null,
       });
       send("launcher:state-changed", state);
       stopCatalogVerificationMonitor();
