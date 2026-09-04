@@ -191,6 +191,15 @@ test("MCP connection remains unavailable until the model catalog is verified", (
   assert.match(appSource, /!manualInteraction && !configuringInactiveMode && !snapshot\.state\.codexCatalogVerified/);
 });
 
+test("the catalog gate does not wait on a request an external catalog never sends", () => {
+  // Every setup run resets codexCatalogVerified, so on a config that pins
+  // model_catalog_json the MCP page would re-lock mid-flow and never recover.
+  assert.match(electronMain, /codexUsesExternalModelCatalog\(codexHome\)/);
+  assert.match(electronMain, /if \(!served && !externalCatalog\) return;/);
+  // The two proofs must stay distinguishable in the log.
+  assert.match(electronMain, /verifiedBy: served \? "codex-request" : "external-model-catalog"/);
+});
+
 test("MCP navigation remains locked while an operation is active", () => {
   assert.match(appSource, /<McpSurface[\s\S]*?operation=\{operation\}/);
   assert.match(appSource, /const busy = localBusy \|\| operation\?\.status === "running"/);
