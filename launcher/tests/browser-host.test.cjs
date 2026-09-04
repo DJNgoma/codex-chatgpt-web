@@ -955,6 +955,70 @@ test("an incomplete sign-in names the missing proof once per distinct state", as
   assert.deepEqual(changed[1][1].missing, ["composer", "temporary-chat", "server-session"]);
 });
 
+test("the passkey handoff keeps the launcher window in front of Chrome, then restores it", async () => {
+  const floats = [];
+  let shownInactive = 0;
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    state: { authenticated: false },
+    authNavigationError: null,
+    loginOperation: null,
+    loginKind: null,
+    loginSuperseded: false,
+    sessionRefreshOperation: null,
+    authView: null,
+    window: {
+      isDestroyed: () => false,
+      isVisible: () => false,
+      showInactive: () => { shownInactive += 1; },
+      setAlwaysOnTop: (value, level) => floats.push([value, level]),
+    },
+    activateHomeSurface() {},
+    show() {},
+    setState(patch) { Object.assign(fixture.state, patch); },
+    snapshot: () => ({ ...fixture.state }),
+    logger: { info() {}, warn() {} },
+    withManualOperation: async (_name, action) => await action(),
+    loginWithPasskey: async () => {
+      // While Chrome owns the screen the launcher must already be floating.
+      assert.deepEqual(floats, [[true, "floating"]]);
+      return { storageState: {}, cleanup: async () => {} };
+    },
+    installPasskeyLogin: async () => ({ authenticated: true }),
+  });
+
+  assert.deepEqual(await BrowserHost.prototype.openPasskeyLogin.call(fixture), { authenticated: true });
+  assert.deepEqual(floats, [[true, "floating"], [false, "floating"]]);
+  assert.equal(shownInactive, 1, "the window is revealed without stealing focus from the passkey prompt");
+});
+
+test("a failed passkey handoff still restores the launcher window stacking", async () => {
+  const floats = [];
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    state: { authenticated: false },
+    authNavigationError: null,
+    loginOperation: null,
+    loginKind: null,
+    loginSuperseded: false,
+    sessionRefreshOperation: null,
+    authView: null,
+    window: {
+      isDestroyed: () => false,
+      isVisible: () => true,
+      setAlwaysOnTop: (value, level) => floats.push([value, level]),
+    },
+    activateHomeSurface() {},
+    show() {},
+    setState(patch) { Object.assign(fixture.state, patch); },
+    snapshot: () => ({ ...fixture.state }),
+    logger: { info() {}, warn() {} },
+    withManualOperation: async (_name, action) => await action(),
+    loginWithPasskey: async () => { throw new Error("Chrome closed"); },
+  });
+
+  await assert.rejects(BrowserHost.prototype.openPasskeyLogin.call(fixture), /Chrome closed/);
+  assert.deepEqual(floats, [[true, "floating"], [false, "floating"]]);
+});
+
 test("explicit login waits for an in-flight saved-session refresh before taking browser ownership", async () => {
   const calls = [];
   let finishRefresh;

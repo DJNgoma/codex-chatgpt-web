@@ -1004,7 +1004,8 @@ function BrowserSurface({
             <BrandMark />
             <h1>{manualInteraction
               ? copy.browserReady
-              : browser?.authenticated ? copy.noActiveTask : copy.stepAccount}</h1>
+              : browser?.authenticated ? copy.noActiveTask
+              : passkeyWaiting ? copy.passkeyWaitingTitle : copy.stepAccount}</h1>
             <p>{manualInteraction
               ? copy.stepAccountBody
               : browser?.authenticated
