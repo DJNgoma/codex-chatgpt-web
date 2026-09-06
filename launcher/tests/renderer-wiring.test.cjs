@@ -191,15 +191,15 @@ test("MCP connection remains unavailable until the model catalog is verified", (
   assert.match(appSource, /!manualInteraction && !configuringInactiveMode && !snapshot\.state\.codexCatalogVerified/);
 });
 
-test("the catalog gate does not wait on a request an external catalog never sends", () => {
-  // Every setup run resets codexCatalogVerified, so on a config that pins
-  // model_catalog_json the MCP page would re-lock mid-flow and never recover.
-  // The fallback needs the catalog to actually list the models: this bridge never writes into
-  // an external catalog, so its mere presence is no evidence that the picker will show them.
-  assert.match(electronMain, /externalCatalogListsChatGptWebModels\(codexHomePath\(\)\)/);
-  assert.match(electronMain, /if \(!served && !externalCatalog\) return;/);
-  // The two proofs must stay distinguishable in the log.
-  assert.match(electronMain, /verifiedBy: served \? "codex-request" : "external-model-catalog"/);
+test("the catalogue monitor uses the behaviourally tested evidence policy", () => {
+  const monitor = electronMain.slice(
+    electronMain.indexOf("function startCatalogVerificationMonitor"),
+    electronMain.indexOf("async function restoreCodexRouteAfterRuntimeFailure"),
+  );
+  assert.match(monitor, /catalogVerificationPatch\(stateStore\.read\(\), picker, health\)/);
+  assert.match(monitor, /stateStore\.update\(patch\)/);
+  assert.doesNotMatch(monitor, /codexRestartRequired: false/);
+  assert.match(monitor, /verifiedBy: patch\.codexCatalogVerificationSource/);
 });
 
 test("MCP navigation remains locked while an operation is active", () => {
@@ -288,6 +288,9 @@ test("installed models can be checked without redoing the install", () => {
   // restarted onto the route, so the check must never request it.
   assert.doesNotMatch(handler, /v1\/models/);
   assert.match(handler, /inspectCodexModelPicker\(codexHomePath\(\)\)/);
-  // A verified check unlocks the gate that install would otherwise have to be re-run to unlock.
-  assert.match(handler, /stateStore\.update\(\{ codexCatalogVerified: true, codexRestartRequired: false \}\)/);
+  assert.match(handler, /catalogVerificationPatch\(state, picker, health\)/);
+  assert.match(handler, /stateStore\.update\(patch\)/);
+  assert.doesNotMatch(handler, /codexRestartRequired: false/);
+  assert.match(appSource, /copy\.modelsRuntimeUnverified/);
+  assert.match(appSource, /!report\.catalogReadable \|\| report\.source === "unknown"/);
 });

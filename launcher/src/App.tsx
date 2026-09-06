@@ -2072,7 +2072,7 @@ function ModelCheckNotice({ copy, report }: { copy: Copy; report: ModelCheckRepo
   // A catalog that lists the models while this bridge's route is missing is a third state: the
   // picker entries exist but nothing routes them here, and telling the user the catalog is empty
   // would be false.
-  const summary = report.installed
+  const summary = !report.catalogReadable || report.source === "unknown" ? copy.modelsUnknownSource : report.installed
     ? external ? copy.modelsInstalledCatalog : copy.modelsInstalledBridge
     : external
       ? report.models.length > 0 ? copy.modelsRouteMissing : copy.modelsMissingCatalog
@@ -2084,11 +2084,14 @@ function ModelCheckNotice({ copy, report }: { copy: Copy; report: ModelCheckRepo
     ? [...new Set(visible.map(model => model.displayName))]
     : report.models.map(model => model.slug);
   return (
-    <NoticeRow icon={report.installed ? "check" : "alert"} tone={report.installed ? "success" : "warning"}>
+    <NoticeRow icon={report.runtimeVerified ? "check" : "alert"} tone={report.runtimeVerified ? "success" : "warning"}>
       {summary}
       {listed.length > 0 ? ` ${listed.join(", ")}.` : ""}
       {external && report.catalogPath
         ? <small className="notice-detail">{`${copy.modelsPickerSource}: ${report.catalogPath}`}</small>
+        : null}
+      {external && report.installed
+        ? <small className="notice-detail">{copy.modelsRuntimeUnverified}</small>
         : null}
       {report.detail ? <small className="notice-detail">{report.detail}</small> : null}
     </NoticeRow>

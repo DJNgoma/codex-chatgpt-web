@@ -21,6 +21,7 @@ export interface LauncherState {
   browserSmokeVersion?: string | null;
   coreSetupComplete?: boolean;
   codexCatalogVerified?: boolean;
+  codexCatalogVerificationSource?: "codex-request" | "external-model-catalog";
   mcpSetupComplete?: boolean;
   mcpRuntimeInstalled?: boolean;
   codexRestartRequired?: boolean;
@@ -86,11 +87,12 @@ export interface InstalledModel {
   visible: boolean;
 }
 
-// What Codex's model picker will actually show, read from whichever source owns it.
+// Configured catalogue entries and independently observed runtime evidence.
 export interface ModelCheckReport {
   installed: boolean;
+  runtimeVerified: boolean;
   routeInstalled: boolean;
-  source: "bridge" | "external";
+  source: "bridge" | "external" | "unknown";
   catalogPath: string | null;
   catalogReadable: boolean;
   models: InstalledModel[];

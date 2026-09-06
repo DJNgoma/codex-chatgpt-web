@@ -19,9 +19,9 @@ const { BrowserHost, navigationErrorForLog } = require("./browser-host.cjs");
 const { BrowserControlServer } = require("./control-server.cjs");
 const { getAutostart, setAutostart } = require("./autostart.cjs");
 const {
-  externalCatalogListsChatGptWebModels,
   inspectCodexModelPicker,
 } = require("./codex-catalog-route.cjs");
+const { catalogVerificationPatch, legacyCatalogVerificationPatch } = require("./catalog-verification.cjs");
 const {
   createLogger,
   exportSanitizedLogs,
@@ -142,22 +142,19 @@ function startCatalogVerificationMonitor({ logger, stateStore }) {
     if (catalogVerificationInFlight || !runtimeSupervisor) return;
     catalogVerificationInFlight = true;
     try {
-      const config = runtimeSupervisor.readConfig();
-      const health = await runtimeSupervisor.proxyHealthPayload(config);
-      const served = Number.isInteger(health?.successful_model_catalog_requests)
-        && health.successful_model_catalog_requests >= 1;
-      // Prefer the real signal; fall back only when it provably cannot arrive, and
-      // record which path proved it so the two are never confused in the log.
-      // An external catalog owns the picker only when it actually lists the ChatGPT Web models:
-      // this bridge never writes into one, so its mere presence proves nothing about the picker.
-      const externalCatalog = !served && externalCatalogListsChatGptWebModels(codexHomePath());
-      if (!served && !externalCatalog) return;
-      const state = stateStore.update({
-        codexCatalogVerified: true,
-        codexRestartRequired: false,
-      });
+      const picker = inspectCodexModelPicker(codexHomePath());
+      let health = null;
+      try {
+        health = await runtimeSupervisor.proxyHealthPayload(runtimeSupervisor.readConfig());
+      } catch (error) {
+        logger.debug("codex.model_catalog_runtime_unavailable", { message: error.message });
+      }
+      const patch = catalogVerificationPatch(stateStore.read(), picker, health);
+      if (!patch) return;
+      const state = stateStore.update(patch);
       logger.info("codex.model_catalog_verified", {
-        verifiedBy: served ? "codex-request" : "external-model-catalog",
+        verifiedBy: patch.codexCatalogVerificationSource,
+        runtimeVerified: patch.codexCatalogVerificationSource === "codex-request",
         requests: health?.successful_model_catalog_requests ?? 0,
         at: health?.last_successful_model_catalog_request_at ?? null,
       });
@@ -723,19 +720,19 @@ function registerIpc({ logger, stateStore }) {
     if (!IS_DEV_PROFILE) startCatalogVerificationMonitor({ logger, stateStore });
     return { ok: true, stdout: result.stdout, restartRequired: !IS_DEV_PROFILE };
   });
-  // Install models is the only surface that reports whether Codex can see the ChatGPT Web models,
-  // so asking the question meant redoing the install — which rewrites Codex's config and resets the
-  // catalog verification flag. This answers it from what is already on disk and changes nothing,
-  // except to record a proof it found rather than one it manufactured.
+  // Check installed entries without reinstalling or fabricating a catalogue request.
+  // File evidence may unlock the catalogue gate, but only runtime evidence clears a restart.
   handle("launcher:check-models", async () => {
     if (IS_DEV_PROFILE) throw new Error("The DEV profile installs no Codex model route to check");
     const picker = inspectCodexModelPicker(codexHomePath());
     let served = 0;
     let servedAt = null;
     let runtimeDetail = null;
+    let health = null;
     try {
-      const health = await runtimeSupervisor.proxyHealthPayload(runtimeSupervisor.readConfig());
-      if (Number.isInteger(health?.successful_model_catalog_requests)) {
+      health = await runtimeSupervisor.proxyHealthPayload(runtimeSupervisor.readConfig());
+      if (Number.isSafeInteger(health?.successful_model_catalog_requests)
+        && health.successful_model_catalog_requests >= 0) {
         served = health.successful_model_catalog_requests;
       }
       servedAt = health?.last_successful_model_catalog_request_at ?? null;
@@ -744,10 +741,12 @@ function registerIpc({ logger, stateStore }) {
       runtimeDetail = error instanceof Error ? error.message : String(error);
     }
     const state = stateStore.read();
-    const installed = state.coreSetupComplete === true
-      && (picker.source === "external" ? picker.models.length > 0 : served >= 1);
+    const patch = catalogVerificationPatch(state, picker, health);
+    const installed = patch !== null;
+    const runtimeVerified = patch?.codexCatalogVerificationSource === "codex-request";
     const report = {
       installed,
+      runtimeVerified,
       routeInstalled: state.coreSetupComplete === true,
       source: picker.source,
       catalogPath: picker.catalogPath,
@@ -759,12 +758,13 @@ function registerIpc({ logger, stateStore }) {
     };
     logger.info("codex.model_check", {
       installed,
+      runtimeVerified,
       source: picker.source,
       models: picker.models.length,
       requests: served,
     });
-    if (installed && state.codexCatalogVerified !== true) {
-      const updated = stateStore.update({ codexCatalogVerified: true, codexRestartRequired: false });
+    if (patch && Object.entries(patch).some(([key, value]) => state[key] !== value)) {
+      const updated = stateStore.update(patch);
       stopCatalogVerificationMonitor();
       send("launcher:state-changed", updated);
       return { ...report, state: updated };
@@ -1007,6 +1007,8 @@ async function start() {
     stateStore.update({ sessionRefreshReminderAt: nextSessionRefreshReminderAt() });
   }
   const persistedState = stateStore.read();
+  const legacyVerification = !IS_DEV_PROFILE && legacyCatalogVerificationPatch(persistedState);
+  if (legacyVerification) stateStore.update(legacyVerification);
   if (persistedState.coreSetupComplete === true && persistedState.codexCatalogVerified === undefined) {
     stateStore.update({
       coreSetupComplete: false,
