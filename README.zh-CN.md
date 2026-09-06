@@ -151,6 +151,10 @@ bun run app
 取消保留的浏览器任务，或在卸载前移除 Codex 集成。仅在需要为每个浏览器检查点保存截图时设置
 `CODEX_CHATGPT_WEB_BROWSER_DIAGNOSTICS=1`。
 
+如果 ChatGPT 仍能正常返回文本，但 Codex Native2 工具调用返回 `502`，工具通道可能出现了独立于
+模型通道的故障。请参阅[故障排查](TROUBLESHOOTING.md#every-codex-native2-tool-call-returns-502-but-chatgpt-text-still-works)
+中的分平台恢复步骤，并在重启隧道前完成或取消正在运行的任务。
+
 新安装默认使用 **Compatibility V1** 以支持跨后端 subagent。**Native** 会保留 Codex 自身的
 功能设置，并启用明文 Web-to-Web V2 委派。切换协议后，请重启 Codex 并创建新任务：
 

@@ -615,6 +615,95 @@ test("recent internal MCP transport failures override false-green tunnel readine
   }
 });
 
+test("monitoring discovers an uncached tunnel endpoint and detects a wedged MCP dispatcher", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-tunnel-mcp-unowned-"));
+  const health = await localHealthServer(
+    () => 200,
+    pathname => pathname.startsWith("/api/logs")
+      ? JSON.stringify({
+        events: [{
+          time: new Date().toISOString(),
+          level: "WARN",
+          message: "dispatcher received MCP upstream error; posted error response to control plane",
+          attrs: {
+            failure_source: "client_internal",
+            status_code: 502,
+            upstream_response_received: false,
+            rpc_method: "tools/call",
+          },
+        }],
+      })
+      : "ok",
+  );
+  const supervisor = new RuntimeSupervisor({
+    app: { getVersion: () => "0.2.0", isPackaged: false },
+    logger: { info() {}, warn() {}, error() {} },
+    sourceRoot: root,
+    coreHome: root,
+    browserDescriptorPath: path.join(root, "launcher.json"),
+  });
+  // Discovery must not depend on a managed process identity being available.
+  supervisor.tunnel = null;
+  supervisor.tunnelHealthBaseUrl = null;
+  let discoveries = 0;
+  supervisor.runTunnelCommand = async (_config, args) => {
+    discoveries += 1;
+    assert.deepEqual(args, ["runtimes", "status", "codex-chatgpt-web", "--json"]);
+    return {
+      code: 0,
+      output: JSON.stringify({ local: { effective_health: { base_url: health.baseUrl } } }),
+    };
+  };
+  try {
+    const config = { tunnel: { alias: "codex-chatgpt-web" } };
+    const observation = await supervisor.observeTunnelForMonitor(config);
+    assert.equal(discoveries, 1);
+    assert.equal(observation.ready, false);
+    assert.equal(observation.statusKnown, true);
+    assert.equal(observation.fatal, true);
+    assert.match(observation.detail, /MCP transport returned internal HTTP 502/);
+    assert.equal((await supervisor.observeTunnelForMonitor(config)).fatal, true);
+    assert.equal(discoveries, 1, "the cached endpoint must avoid repeated discovery commands");
+  } finally {
+    await health.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+for (const [label, discovery] of [
+  ["command failure", { code: 1, output: "status unavailable" }],
+  ["malformed JSON", { code: 0, output: "not JSON" }],
+  ["non-loopback URL", { code: 0, output: JSON.stringify({ health_url: "https://example.com" }) }],
+]) {
+  test(`failed tunnel discovery remains unknown when inventory is unavailable: ${label}`, async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-discovery-unknown-"));
+    const supervisor = new RuntimeSupervisor({
+      app: { getVersion: () => "0.2.0", isPackaged: false },
+      logger: { info() {}, warn() {}, error() {} },
+      sourceRoot: root,
+      coreHome: root,
+      browserDescriptorPath: path.join(root, "launcher.json"),
+    });
+    let discoveries = 0;
+    supervisor.runTunnelCommand = async () => {
+      discoveries += 1;
+      return discovery;
+    };
+    supervisor.readTunnelHealth = async () => { throw new Error("inventory unavailable"); };
+    try {
+      const observation = await supervisor.observeTunnelForMonitor({ tunnel: { alias: "codex-chatgpt-web" } });
+      assert.equal(discoveries, 1);
+      assert.equal(supervisor.tunnelHealthBaseUrl, null);
+      assert.equal(observation.ready, false);
+      assert.equal(observation.statusKnown, false);
+      assert.equal(observation.fatal, false);
+      assert.match(observation.detail, /native status unavailable/);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
+
 test("tunnel readiness accepts the official tmux status without inventing a PID", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-tunnel-health-tmux-"));
   const supervisor = new RuntimeSupervisor({
