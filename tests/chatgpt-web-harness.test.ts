@@ -5,10 +5,11 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import type { Page } from "playwright-core";
 import { buildResponseJSON } from "../src/bridge";
 import { ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
 import { ChatGptCompletionTracker, chatGptImageFilePayloads, chatGptPromptFilePayloads, chatGptTurnIsComplete } from "../src/adapters/chatgpt-web/browser-worker";
-import { ChatGptBrowserWorker, type BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
+import { ChatGptBrowserWorker, waitForOperationalChatGptViewport, type BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptConversationKey } from "../src/adapters/chatgpt-web/conversation-key";
 import { CHATGPT_TURN_REVISION_CONFLICT_MESSAGE, extractChatGptTurnEnvironment, extractChatGptTurnIdentity, extractChatGptTurnUserRevision, priorChatGptAbortedTurnIds } from "../src/adapters/chatgpt-web/environment";
 import { CHATGPT_WEB_ADAPTER_HEARTBEAT_MS, chatGptWebExecutionNamespace, chatGptWebTraceId, createChatGptWebAdapter } from "../src/adapters/chatgpt-web/index";
@@ -1242,6 +1243,85 @@ describe("ChatGPT outer-native harness v4", () => {
       await TurnBroker.forSocket(socketPath).close();
     }
   });
+
+  test("caps initial viewport acquisition retries across adapter instances", async () => {
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://chatgpt-viewport-retry-${Date.now()}`,
+      chatgptWeb: { localToolsEnabled: false, solAvailable: true, proAvailable: true },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    const page = {
+      waitForFunction: () => Promise.reject(new Error("operational viewport timed out")),
+    } as unknown as Page;
+    let browserStarts = 0;
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      browserStarts += 1;
+      await waitForOperationalChatGptViewport(page, turn.abortSignal, { allowTurnRetry: true });
+      throw new Error("collapsed viewport unexpectedly became operational");
+    };
+    try {
+      const request = rawWireRequest(environmentXml);
+      for (let attempt = 0; attempt < MAX_CHATGPT_WEB_TURN_RETRIES + 2; attempt += 1) {
+        const events: AdapterEvent[] = [];
+        await createChatGptWebAdapter(provider).runTurn!(
+          request, { headers: new Headers() }, event => events.push(event),
+        );
+        expect(events.at(-1)).toMatchObject({
+          type: "error",
+          status: 503,
+          code: "chatgpt_surface_unavailable",
+          retryable: attempt < MAX_CHATGPT_WEB_TURN_RETRIES,
+        });
+      }
+      expect(browserStarts).toBe(MAX_CHATGPT_WEB_TURN_RETRIES + 1);
+    } finally {
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+    }
+  });
+
+  test.each(["send_activated", "accepted"] as const)(
+    "a viewport rebind failure after %s never starts a replacement browser turn",
+    async phase => {
+      const provider: CodexProviderConfig = {
+        adapter: "chatgpt-web",
+        baseUrl: `browser://chatgpt-viewport-${phase}-${Date.now()}`,
+        chatgptWeb: { localToolsEnabled: false, solAvailable: true, proAvailable: true },
+      };
+      const worker = ChatGptBrowserWorker.forProvider(provider);
+      const originalRun = worker.run.bind(worker);
+      const page = {
+        waitForFunction: () => Promise.reject(new Error("operational viewport timed out during rebind")),
+      } as unknown as Page;
+      let browserStarts = 0;
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+        browserStarts += 1;
+        await turn.onSendActivated?.();
+        if (phase === "accepted") turn.onSubmitted?.();
+        await waitForOperationalChatGptViewport(page, turn.abortSignal);
+        throw new Error("collapsed viewport unexpectedly became operational");
+      };
+      try {
+        const request = rawWireRequest(environmentXml);
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          const events: AdapterEvent[] = [];
+          await createChatGptWebAdapter(provider).runTurn!(
+            request, { headers: new Headers() }, event => events.push(event),
+          );
+          expect(events.at(-1)).toMatchObject({
+            type: "error",
+            status: 503,
+            code: "chatgpt_surface_unavailable",
+            retryable: false,
+          });
+        }
+        expect(browserStarts).toBe(1);
+      } finally {
+        (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      }
+    },
+  );
 
   test("prompt preparation preserves its error instead of exposing a revoked MCP token", async () => {
     const socketPath = brokerTestEndpoint(`cgw-prepare-error-${process.pid}-${Date.now()}`);

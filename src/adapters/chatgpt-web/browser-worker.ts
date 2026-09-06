@@ -1086,7 +1086,11 @@ export async function connectAfterClosingBrowserConnection<T>(
 
 export const CHATGPT_MIN_OPERATIONAL_VIEWPORT = Object.freeze({ width: 320, height: 240 });
 
-async function waitForOperationalChatGptViewport(page: Page, signal?: AbortSignal): Promise<void> {
+export async function waitForOperationalChatGptViewport(
+  page: Page,
+  signal?: AbortSignal,
+  options: { allowTurnRetry?: boolean } = {},
+): Promise<void> {
   try {
     await withBrowserTurnAbort(page.waitForFunction(
       ({ width, height }) => innerWidth >= width && innerHeight >= height,
@@ -1095,8 +1099,16 @@ async function waitForOperationalChatGptViewport(page: Page, signal?: AbortSigna
     ), signal);
   } catch (error) {
     if (signal?.aborted) throw new DOMException("ChatGPT browser page acquisition aborted", "AbortError");
-    throw new Error(
+    // Only initial page acquisition may opt into the shared browser-turn retry budget. A rebind
+    // can happen after submission or tool execution, when a fresh turn could repeat side effects.
+    throw new ChatGptWebAdapterError(
       `ChatGPT browser surface did not expose an operational viewport: ${error instanceof Error ? error.message : String(error)}`,
+      {
+        status: 503,
+        errorType: "server_error",
+        code: "chatgpt_surface_unavailable",
+        retryable: options.allowTurnRetry === true,
+      },
     );
   }
 }
@@ -4256,7 +4268,7 @@ export class ChatGptBrowserWorker {
           throw new DOMException("ChatGPT browser page acquisition aborted", "AbortError");
         }
         turnConnection = connection.browser;
-        await waitForOperationalChatGptViewport(connection.page, abortSignal);
+        await waitForOperationalChatGptViewport(connection.page, abortSignal, { allowTurnRetry: true });
         return connection.page;
       });
       if (!maintenancePage && !launcherSurfaceId) managedPage = page;
