@@ -123,6 +123,39 @@ approval review**, disable that optional Codex review setting and restart Codex.
 sandbox and explicit approvals still apply; this only prevents an unavailable native model from
 being inserted as an extra reviewer after the Web tool call already completed.
 
+## Every Codex Native2 tool call returns `502`, but ChatGPT text still works
+
+Repeated `502 Upstream or external service errors` from tool discovery and execution can indicate
+a tunnel dispatcher problem even while ordinary ChatGPT text continues streaming. HTTP `502` alone
+does not establish the cause. In the tunnel-client diagnostic log, look for this recent pattern:
+
+- one `command response deadline reached; dropping without posting`, then
+- `dispatcher received MCP upstream error` repeating, with `status_code=502`,
+  `failure_source=client_internal`, and `upstream_response_received=false`.
+
+The pattern is stronger when `dispatcher forwarded command to MCP server` stops appearing after the
+failure. A running process or a green `tunnel status` result does not prove that MCP calls can
+execute. The launcher also inspects recent internal MCP transport failures through the tunnel's
+loopback diagnostics endpoint. Continued chat text does not establish that the MCP server or its
+configuration is healthy.
+
+For a **launcher-managed macOS installation**, finish or cancel active Codex tasks first. Keep the
+launcher running, then stop the affected tunnel:
+
+```bash
+codex-chatgpt-web tunnel stop
+```
+
+The launcher monitor attempts to start a replacement, subject to its restart budget. Use `tunnel
+stop`, not `tunnel restart`: restart targets the installed macOS service rather than the
+launcher-owned runtime. The current CLI stop path also requires macOS service management, so this
+command is not a Windows/Linux recovery shortcut.
+
+On **Windows or Linux**, finish or cancel active tasks, then quit and reopen the launcher instead.
+After recovery, confirm that a read-only Codex Native2 tool call succeeds in Codex; a green status
+indicator alone is insufficient. If calls still fail, collect privacy-safe diagnostics and investigate
+the cause rather than assuming that reinstalling or changing configuration will fix it.
+
 ## `Reconnecting`, `stream disconnected`, or `ChatGPT failed`
 
 These are result boundaries, not one diagnosis. The bridge uses them when it cannot prove a complete

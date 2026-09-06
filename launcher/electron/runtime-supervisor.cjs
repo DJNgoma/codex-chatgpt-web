@@ -827,7 +827,16 @@ class RuntimeSupervisor {
     );
   }
 
-  async readLocalTunnelHealth() {
+  async readLocalTunnelHealth(config) {
+    // An existing tunnel may not yet have a cached loopback health endpoint. Discover it before
+    // probing so inventory readiness cannot hide recent internal MCP transport failures.
+    if (!this.tunnelHealthBaseUrl && config?.tunnel) {
+      try {
+        await this.discoverTunnelHealthBaseUrl(config);
+      } catch {
+        // Best effort: the probes below still report whatever they can observe.
+      }
+    }
     const [healthz, readyz, mcp] = await Promise.all([
       this.probeTunnelEndpoint("/healthz"),
       this.probeTunnelEndpoint("/readyz"),
@@ -878,7 +887,7 @@ class RuntimeSupervisor {
   }
 
   async observeTunnelForMonitor(config) {
-    const local = await this.readLocalTunnelHealth();
+    const local = await this.readLocalTunnelHealth(config);
     if (local.statusKnown) return local;
     try {
       return await this.readTunnelHealth(config);

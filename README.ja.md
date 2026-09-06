@@ -160,6 +160,11 @@ ChatGPT のツール呼び出しを現在の Codex タスクへ接続します�
 アンインストール前の Codex 統合削除も行えます。すべてのブラウザーチェックポイントでスクリーンショットが必要な場合にのみ、
 `CODEX_CHATGPT_WEB_BROWSER_DIAGNOSTICS=1` を設定してください。
 
+ChatGPT の通常の応答は届くのに Codex Native2 のツール呼び出しが `502` を返す場合は、
+モデル経路とは別にツール経路で問題が発生している可能性があります。OS 別の復旧手順は
+[トラブルシューティング](TROUBLESHOOTING.md#every-codex-native2-tool-call-returns-502-but-chatgpt-text-still-works)
+を参照してください。トンネルを再起動する前に、実行中のタスクを完了またはキャンセルしてください。
+
 新規インストールでは、クロスバックエンドのサブエージェントに **Compatibility V1** を使用します。
 **Native** は Codex 独自の機能設定を維持し、プレーンテキストの Web-to-Web V2 delegation を有効にします。
 プロトコル変更後は Codex を再起動し、新しいタスクを開始してください。

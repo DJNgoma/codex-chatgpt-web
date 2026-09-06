@@ -165,6 +165,11 @@ Use **Activity** for safe local diagnostics and **Settings → Run doctor** for 
 Settings can also cancel a retained browser turn or remove the Codex integration before uninstall.
 Set `CODEX_CHATGPT_WEB_BROWSER_DIAGNOSTICS=1` only when every browser checkpoint needs a screenshot.
 
+If Codex Native2 tool calls return `502` while ordinary ChatGPT replies still stream, the tool path
+may be unhealthy independently of the model path. See the platform-specific recovery steps in
+[Troubleshooting](TROUBLESHOOTING.md#every-codex-native2-tool-call-returns-502-but-chatgpt-text-still-works),
+and finish or cancel active tasks before restarting the tunnel.
+
 New installs use **Compatibility V1** for cross-backend subagents. **Native** preserves Codex's own
 feature settings and enables plaintext Web-to-Web V2 delegation. Restart Codex and start a new task
 after changing the protocol:
