@@ -80,6 +80,26 @@ export interface DoctorReport {
   checks: DoctorCheck[];
 }
 
+export interface InstalledModel {
+  slug: string;
+  displayName: string;
+  visible: boolean;
+}
+
+// What Codex's model picker will actually show, read from whichever source owns it.
+export interface ModelCheckReport {
+  installed: boolean;
+  routeInstalled: boolean;
+  source: "bridge" | "external";
+  catalogPath: string | null;
+  catalogReadable: boolean;
+  models: InstalledModel[];
+  servedCatalogRequests: number;
+  lastServedAt: string | null;
+  detail: string | null;
+  state?: LauncherState;
+}
+
 export interface OperationState {
   name: string;
   status: "running" | "completed" | "failed";
@@ -146,6 +166,7 @@ export interface LauncherApi {
   cancelTurns(): Promise<{ stdout: string }>;
   uninstallIntegration(): Promise<{ cancelled: true } | { cancelled: false; state: LauncherState }>;
   setupCore(): Promise<{ ok: boolean; stdout: string; restartRequired: boolean }>;
+  checkModels(): Promise<ModelCheckReport>;
   setupMcp(input: {
     tunnelId?: string;
     runtimeKey?: string;

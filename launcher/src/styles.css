@@ -1385,6 +1385,15 @@ code {
   color: var(--color-text-success);
 }
 
+/* A catalog path or a runtime message is evidence for the sentence above it, not part of it. */
+.notice-row .notice-detail {
+  display: block;
+  margin-top: 4px;
+  color: var(--color-text-tertiary);
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
+}
+
 .next-surface-row {
   display: grid;
   width: 100%;

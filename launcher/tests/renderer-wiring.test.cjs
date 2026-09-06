@@ -194,7 +194,9 @@ test("MCP connection remains unavailable until the model catalog is verified", (
 test("the catalog gate does not wait on a request an external catalog never sends", () => {
   // Every setup run resets codexCatalogVerified, so on a config that pins
   // model_catalog_json the MCP page would re-lock mid-flow and never recover.
-  assert.match(electronMain, /codexUsesExternalModelCatalog\(codexHome\)/);
+  // The fallback needs the catalog to actually list the models: this bridge never writes into
+  // an external catalog, so its mere presence is no evidence that the picker will show them.
+  assert.match(electronMain, /externalCatalogListsChatGptWebModels\(codexHomePath\(\)\)/);
   assert.match(electronMain, /if \(!served && !externalCatalog\) return;/);
   // The two proofs must stay distinguishable in the log.
   assert.match(electronMain, /verifiedBy: served \? "codex-request" : "external-model-catalog"/);
@@ -268,4 +270,24 @@ test("completed model setup remains a repeatable capability probe", () => {
     electronMain,
     /!setupState\.coreSetupComplete[\s\S]*?smokePassedThisSession[\s\S]*?smokePassedForCurrentVersion\(setupState\)/,
   );
+});
+
+test("installed models can be checked without redoing the install", () => {
+  // Install models rewrites Codex's config and resets codexCatalogVerified, so asking whether the
+  // models are already there must not go through it.
+  assert.match(preloadSource, /checkModels:[\s\S]*?launcher:check-models/);
+  assert.match(appSource, /const report = await api!\.checkModels\(\);/);
+  assert.match(appSource, /onSecondaryAction=\{devProfile \? undefined : checkModels\}/);
+
+  const handler = electronMain.slice(
+    electronMain.indexOf('handle("launcher:check-models"'),
+    electronMain.indexOf('handle("launcher:setup-mcp"'),
+  );
+  assert.ok(handler.length > 0);
+  // Asking this bridge for /v1/models would increment the very counter that proves Codex
+  // restarted onto the route, so the check must never request it.
+  assert.doesNotMatch(handler, /v1\/models/);
+  assert.match(handler, /inspectCodexModelPicker\(codexHomePath\(\)\)/);
+  // A verified check unlocks the gate that install would otherwise have to be re-run to unlock.
+  assert.match(handler, /stateStore\.update\(\{ codexCatalogVerified: true, codexRestartRequired: false \}\)/);
 });

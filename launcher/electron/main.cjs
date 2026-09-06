@@ -18,7 +18,10 @@ const {
 const { BrowserHost, navigationErrorForLog } = require("./browser-host.cjs");
 const { BrowserControlServer } = require("./control-server.cjs");
 const { getAutostart, setAutostart } = require("./autostart.cjs");
-const { codexUsesExternalModelCatalog } = require("./codex-catalog-route.cjs");
+const {
+  externalCatalogListsChatGptWebModels,
+  inspectCodexModelPicker,
+} = require("./codex-catalog-route.cjs");
 const {
   createLogger,
   exportSanitizedLogs,
@@ -117,6 +120,12 @@ function publishOperation(operation) {
   send("launcher:operation", operation);
 }
 
+// The launcher always pins CODEX_HOME to its own profile; the default is the fallback for a
+// process that somehow lost it.
+function codexHomePath() {
+  return process.env.CODEX_HOME?.trim() || path.join(app.getPath("home"), ".codex");
+}
+
 function stopCatalogVerificationMonitor() {
   if (catalogVerificationTimer) clearInterval(catalogVerificationTimer);
   catalogVerificationTimer = null;
@@ -139,8 +148,9 @@ function startCatalogVerificationMonitor({ logger, stateStore }) {
         && health.successful_model_catalog_requests >= 1;
       // Prefer the real signal; fall back only when it provably cannot arrive, and
       // record which path proved it so the two are never confused in the log.
-      const codexHome = process.env.CODEX_HOME?.trim() || path.join(app.getPath("home"), ".codex");
-      const externalCatalog = !served && codexUsesExternalModelCatalog(codexHome);
+      // An external catalog owns the picker only when it actually lists the ChatGPT Web models:
+      // this bridge never writes into one, so its mere presence proves nothing about the picker.
+      const externalCatalog = !served && externalCatalogListsChatGptWebModels(codexHomePath());
       if (!served && !externalCatalog) return;
       const state = stateStore.update({
         codexCatalogVerified: true,
@@ -712,6 +722,54 @@ function registerIpc({ logger, stateStore }) {
     });
     if (!IS_DEV_PROFILE) startCatalogVerificationMonitor({ logger, stateStore });
     return { ok: true, stdout: result.stdout, restartRequired: !IS_DEV_PROFILE };
+  });
+  // Install models is the only surface that reports whether Codex can see the ChatGPT Web models,
+  // so asking the question meant redoing the install — which rewrites Codex's config and resets the
+  // catalog verification flag. This answers it from what is already on disk and changes nothing,
+  // except to record a proof it found rather than one it manufactured.
+  handle("launcher:check-models", async () => {
+    if (IS_DEV_PROFILE) throw new Error("The DEV profile installs no Codex model route to check");
+    const picker = inspectCodexModelPicker(codexHomePath());
+    let served = 0;
+    let servedAt = null;
+    let runtimeDetail = null;
+    try {
+      const health = await runtimeSupervisor.proxyHealthPayload(runtimeSupervisor.readConfig());
+      if (Number.isInteger(health?.successful_model_catalog_requests)) {
+        served = health.successful_model_catalog_requests;
+      }
+      servedAt = health?.last_successful_model_catalog_request_at ?? null;
+    } catch (error) {
+      // The bridge being down says nothing about the picker; report it beside the answer.
+      runtimeDetail = error instanceof Error ? error.message : String(error);
+    }
+    const state = stateStore.read();
+    const installed = state.coreSetupComplete === true
+      && (picker.source === "external" ? picker.models.length > 0 : served >= 1);
+    const report = {
+      installed,
+      routeInstalled: state.coreSetupComplete === true,
+      source: picker.source,
+      catalogPath: picker.catalogPath,
+      catalogReadable: picker.readable,
+      models: picker.models,
+      servedCatalogRequests: served,
+      lastServedAt: servedAt,
+      detail: picker.error || runtimeDetail,
+    };
+    logger.info("codex.model_check", {
+      installed,
+      source: picker.source,
+      models: picker.models.length,
+      requests: served,
+    });
+    if (installed && state.codexCatalogVerified !== true) {
+      const updated = stateStore.update({ codexCatalogVerified: true, codexRestartRequired: false });
+      stopCatalogVerificationMonitor();
+      send("launcher:state-changed", updated);
+      return { ...report, state: updated };
+    }
+    return report;
   });
   handle("launcher:setup-mcp", async (_event, input) => {
     const currentMode = stateStore.read().browserInteractionMode;

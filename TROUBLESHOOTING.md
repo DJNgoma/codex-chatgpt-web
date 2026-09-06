@@ -25,6 +25,16 @@ log are more useful than another reinstall.
 Fully quit every Codex Desktop window and Codex CLI process, then reopen Codex while the launcher is
 still running. The launcher should move from **Restart Codex** to a verified catalog state.
 
+Press **Check installed** beside **Install models** before reinstalling. It reads Codex's config and
+whichever catalog builds the picker, reports which ChatGPT Web models that source lists, and changes
+nothing — so it answers the question without rewriting the Codex route or resetting the verified
+catalog state that a reinstall would.
+
+If **Check installed** reports that Codex builds its picker from your own model catalog, another
+local bridge owns the picker through a top-level `model_catalog_json`. Codex then reads the picker
+from that file rather than from `openai_base_url`, so the ChatGPT Web models have to be listed there;
+installing over it is refused unless `--replace-codex-route` is passed.
+
 If the models still do not appear:
 
 - run **Repair Codex setup** once;
