@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Page } from "playwright-core";
 import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPLETION_SETTLE_MS, CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS, CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS, ChatGptCompletionTracker, chatGptExternalProgressSuppressesDomHealth, CHATGPT_RESPONSE_DOM_GRACE_MS, MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_COMPOSER_SELECT_ALL_KEY, CHATGPT_STOPPED_THINKING_GRACE_MS, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptPromptAttachmentIntegrityError, ChatGptStoppedThinkingTracker, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCheckpoint, chatGptConnectorAttachmentMode, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptSubmissionEvidence, connectAfterClosingBrowserConnection, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, sanitizeChatGptBrowserDiagnosticState, setChatGptThinkMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout, CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS, browserStageTimeouts, ChatGptSuspensionClock, remainingStageBudgetMs } from "../src/adapters/chatgpt-web/browser-worker";
-import { ensureChatGptPersonalizedConnectorAccess } from "../src/adapters/chatgpt-web/browser-worker";
+import { ensureChatGptPersonalizedConnectorAccess, waitForOperationalChatGptViewport } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptStoppedThinkingError } from "../src/adapters/chatgpt-web/adapter-error";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
 import { CHATGPT_CONNECTOR_NAME, DEV_CHATGPT_CONNECTOR_NAME, defaultChromeExecutable, legacyChatGptConnectorMigrationMessage } from "../src/config";
@@ -349,13 +349,14 @@ test("compaction retry submission evidence cannot make prompt-stage settlement u
 test("launcher page acquisition proves a nonzero operational viewport before DOM interaction", () => {
   const workerSource = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
   const connect = workerSource.indexOf("const connection = await connectLauncherBrowserHost(");
-  const viewport = workerSource.indexOf("await waitForOperationalChatGptViewport(connection.page, abortSignal);", connect);
+  const viewport = workerSource.indexOf("await waitForOperationalChatGptViewport(connection.page, abortSignal, { allowTurnRetry: true });", connect);
   const acquired = workerSource.indexOf('await diagnostics.capture(page, "browser-page-acquired")', viewport);
 
   expect(connect).toBeGreaterThan(-1);
   expect(viewport).toBeGreaterThan(connect);
   expect(acquired).toBeGreaterThan(viewport);
   expect(workerSource).toContain("innerWidth >= width && innerHeight >= height");
+  expect(workerSource).toContain("await waitForOperationalChatGptViewport(rebound.page, signal);");
 });
 
 test("Luna turns without a retained conversation never send connector identity alone", () => {
@@ -2324,6 +2325,61 @@ test("the known terminal ChatGPT error alert returns a structured retryable fail
     retryable: true,
   });
   expect(fixture.pressed).toEqual([]);
+});
+
+test("a collapsed initial viewport explicitly opts into bounded turn retries", async () => {
+  const page = {
+    waitForFunction: () => Promise.reject(new Error("page.waitForFunction: Timeout 10000ms exceeded")),
+  } as unknown as Page;
+
+  await expect(waitForOperationalChatGptViewport(page, undefined, { allowTurnRetry: true })).rejects.toMatchObject({
+    name: "ChatGptWebAdapterError",
+    status: 503,
+    errorType: "server_error",
+    code: "chatgpt_surface_unavailable",
+    retryable: true,
+  });
+});
+
+test("a viewport failure does not authorise a fresh browser turn by default", async () => {
+  const page = {
+    waitForFunction: () => Promise.reject(new Error("operational viewport timed out during rebind")),
+  } as unknown as Page;
+
+  await expect(waitForOperationalChatGptViewport(page)).rejects.toMatchObject({
+    name: "ChatGptWebAdapterError",
+    status: 503,
+    code: "chatgpt_surface_unavailable",
+    retryable: false,
+  });
+});
+
+test("an operational viewport completes without an adapter error", async () => {
+  let observedOptions: unknown;
+  const page = {
+    waitForFunction: (_predicate: unknown, _dimensions: unknown, options: unknown) => {
+      observedOptions = options;
+      return Promise.resolve();
+    },
+  } as unknown as Page;
+
+  await expect(waitForOperationalChatGptViewport(page)).resolves.toBeUndefined();
+  expect(observedOptions).toEqual({ polling: 50, timeout: 10_000 });
+});
+
+test.each(["before", "during"])("viewport cancellation %s acquisition remains AbortError", async timing => {
+  const controller = new AbortController();
+  let finishProbe!: () => void;
+  const probe = new Promise<void>(resolve => { finishProbe = resolve; });
+  const page = { waitForFunction: () => probe } as unknown as Page;
+  if (timing === "before") controller.abort();
+  const result = waitForOperationalChatGptViewport(page, controller.signal, { allowTurnRetry: true });
+  if (timing === "during") controller.abort();
+  try {
+    await expect(result).rejects.toMatchObject({ name: "AbortError" });
+  } finally {
+    finishProbe();
+  }
 });
 
 test("a failed subscription fetch is retryable and does not falsely invalidate ChatGPT login", async () => {
