@@ -1206,7 +1206,7 @@ function SetupSurface({
           secondaryAction={devProfile
             ? undefined
             : checkingModels ? copy.checkingModels : copy.checkModels}
-          secondaryDisabled={busy || snapshot.state.coreSetupComplete !== true}
+          secondaryDisabled={busy}
           title={devProfile ? copy.devStepInstall : copy.stepInstall}
           titleAction={manualInteraction ? (
             <ZeroRiskModelMenu
@@ -2069,9 +2069,14 @@ function NoticeRow({
 // bridge owns it, "no models" and "models this launcher cannot see" are different answers.
 function ModelCheckNotice({ copy, report }: { copy: Copy; report: ModelCheckReport }) {
   const external = report.source === "external";
+  // A catalog that lists the models while this bridge's route is missing is a third state: the
+  // picker entries exist but nothing routes them here, and telling the user the catalog is empty
+  // would be false.
   const summary = report.installed
     ? external ? copy.modelsInstalledCatalog : copy.modelsInstalledBridge
-    : external ? copy.modelsMissingCatalog : copy.modelsMissingBridge;
+    : external
+      ? report.models.length > 0 ? copy.modelsRouteMissing : copy.modelsMissingCatalog
+      : copy.modelsMissingBridge;
   // A catalog can list an entry that Codex hides from the picker, and several hidden entries often
   // share one display name. Name what is selectable; fall back to slugs when nothing is.
   const visible = report.models.filter(model => model.visible);

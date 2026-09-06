@@ -45,6 +45,25 @@ If the models still do not appear:
 A green step 3 followed by a browser-turn error means installation succeeded. Repeating step 3 will
 not repair an unrelated ChatGPT browser or model-turn failure.
 
+## `Codex interrupt lifecycle hook markers changed after setup`
+
+The managed Interrupt hook is written between two comment markers, and the closing marker
+(`# End codex-chatgpt-web interrupt lifecycle hook.`) is the last line of the block. A TOML writer
+that rewrites `config.toml` — Codex's own config editor, or another tool that edits it — drops a
+comment on the final line. The hook's own fields survive, but the closing marker does not, and every
+managed operation then refuses to touch the route: **Install models**, **Repair Codex setup** and
+**Remove Codex integration** all fail with this message.
+
+The bridge now recovers from exactly that case: when the owned block still matches the journal
+byte-for-byte and its trusted hash is valid, a cleanly missing closing marker is treated as the
+dropped comment it is, and the marker is rewritten on the next managed install. Ownership is proved
+by the block and its hash, not by the comment.
+
+It is still a refusal when the block is genuinely ambiguous — an owned field edited, a second
+opening marker, or a duplicated closing marker. Those mean something really did change the hook, and
+the bridge will not overwrite it. Restore the block from a backup, or run
+**Settings → Remove Codex integration** and install again.
+
 ## `openai_base_url changed after setup` or a model is "not supported"
 
 The launcher deliberately refuses to overwrite a route changed by another tool. Only one program

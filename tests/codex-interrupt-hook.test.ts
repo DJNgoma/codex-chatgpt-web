@@ -128,3 +128,63 @@ test("preserves native TOML editor tables inserted before the trailing hook comm
     )).toThrow("changed after setup");
   }
 });
+
+test("recovers a trailing end marker that a TOML rewrite dropped", () => {
+  // The end marker is the fragment's last line, so a writer that rewrites config.toml drops it
+  // while every owned field survives byte-for-byte. Refusing there dead-ends install, restore and
+  // uninstall on a config the user never edited.
+  const original = 'model = "gpt-5.6-sol"\n';
+  const installed = installCodexInterruptHook(
+    original,
+    "/Users/test/.codex/config.toml",
+    { runtimeCommand: ["/opt/runtime"] },
+  );
+  const dropped = installed.text.replace(`${MANAGED_INTERRUPT_HOOK_END}\n`, "")
+    .replace(MANAGED_INTERRUPT_HOOK_END, "");
+  expect(dropped).not.toContain(MANAGED_INTERRUPT_HOOK_END);
+
+  verifyCodexInterruptHook(dropped, installed.installed);
+  const restored = restoreCodexInterruptHook(dropped, installed.installed);
+  expect(restored).toBe(original);
+  verifyCodexInterruptHookRestored(restored);
+});
+
+test("a dropped end marker leaves later config exactly where it is", () => {
+  const original = 'model = "gpt-5.6-sol"\n';
+  const installed = installCodexInterruptHook(
+    original,
+    "/Users/test/.codex/config.toml",
+    { runtimeCommand: ["/opt/runtime"] },
+  );
+  const later = "[features]\ngoals = true\n";
+  const dropped = `${installed.text.replace(`${MANAGED_INTERRUPT_HOOK_END}\n`, "")
+    .replace(MANAGED_INTERRUPT_HOOK_END, "")}${later}`;
+
+  verifyCodexInterruptHook(dropped, installed.installed);
+  expect(restoreCodexInterruptHook(dropped, installed.installed)).toBe(original + later);
+});
+
+test("recovery applies only to a cleanly absent marker, never an edited hook", () => {
+  const installed = installCodexInterruptHook(
+    'model = "gpt-5.6-sol"\n',
+    "/Users/test/.codex/config.toml",
+    { runtimeCommand: ["/opt/runtime"] },
+  );
+  const drop = (text: string) => text.replace(`${MANAGED_INTERRUPT_HOOK_END}\n`, "")
+    .replace(MANAGED_INTERRUPT_HOOK_END, "");
+
+  // An owned field edited with the marker gone is still an edited hook, not a dropped comment.
+  expect(() => restoreCodexInterruptHook(
+    drop(installed.text).replace("timeout = 3", "timeout = 2"), installed.installed,
+  )).toThrow("changed after setup");
+
+  // A second start marker stays ambiguous with or without an end marker.
+  expect(() => restoreCodexInterruptHook(
+    `${drop(installed.text)}${drop(installed.text)}`, installed.installed,
+  )).toThrow("changed after setup");
+
+  // A duplicated end marker is a mangled pair, not a dropped one.
+  expect(() => restoreCodexInterruptHook(
+    `${installed.text}\n${MANAGED_INTERRUPT_HOOK_END}\n`, installed.installed,
+  )).toThrow("markers changed after setup");
+});

@@ -154,8 +154,16 @@ function locateCodexInterruptHook(text: string, installed: InstalledCodexInterru
     throw new Error("Codex interrupt lifecycle hook order changed after setup; refusing to overwrite it");
   }
   const endMarker = text.indexOf(MANAGED_INTERRUPT_HOOK_END, ownedEnd);
-  if (managedMarkerCount(text) !== 1 || endMarker < 0
-    || text.split(MANAGED_INTERRUPT_HOOK_END).length !== 2) {
+  const endMarkerCount = text.split(MANAGED_INTERRUPT_HOOK_END).length - 1;
+  // The end marker is the last line of the fragment, and a TOML writer that rewrites config.toml
+  // drops a trailing comment: it can go missing while every owned field is still byte-for-byte
+  // intact. Ownership is proved by the fragment matching exactly once and by the trusted hash, not
+  // by the comment, so recover the boundary at the end of the owned fields rather than dead-ending
+  // every install, restore and uninstall on a config nobody actually edited. Only a cleanly absent
+  // marker qualifies; a duplicated or relocated one is still ambiguous and still refused.
+  const endMarkerDropped = endMarkerCount === 0 && managedMarkerCount(text) === 1;
+  if (!endMarkerDropped
+    && (managedMarkerCount(text) !== 1 || endMarker < 0 || endMarkerCount !== 1)) {
     throw new Error("Codex interrupt lifecycle hook markers changed after setup; refusing to overwrite them");
   }
   if (codexInterruptHookHash(installed.command) !== installed.trustedHash) {
@@ -163,7 +171,7 @@ function locateCodexInterruptHook(text: string, installed: InstalledCodexInterru
   }
   // Codex's TOML editor inserts new tables before trailing comments. The end marker can therefore
   // move past unrelated config even though the owned hook fields remain unchanged.
-  const appendedConfig = text.slice(ownedEnd, endMarker);
+  const appendedConfig = endMarkerDropped ? "" : text.slice(ownedEnd, endMarker);
   const firstAssignment = appendedConfig.split(/\r\n|\n|\r/)
     .map(line => line.trim()).find(line => line && !line.startsWith("#"));
   if (firstAssignment && !/^\[\[?.+\]\]?(?:\s*#.*)?$/.test(firstAssignment)) {
@@ -186,7 +194,9 @@ function locateCodexInterruptHook(text: string, installed: InstalledCodexInterru
       throw new Error("Codex interrupt lifecycle hook changed after setup; refusing to overwrite it");
     }
   }
-  const end = endMarker + MANAGED_INTERRUPT_HOOK_END.length;
+  // With the marker dropped the owned region simply ends where its fields end, so anything after
+  // it stays exactly where it is instead of being lifted into the hook's place.
+  const end = endMarkerDropped ? ownedEnd : endMarker + MANAGED_INTERRUPT_HOOK_END.length;
   const trailing = installed.fragment.slice(marker + MANAGED_INTERRUPT_HOOK_END.length);
   const trailingLength = new RegExp("^" + hookTextPattern(trailing)).exec(text.slice(end))?.[0].length ?? 0;
   return { start: first, end: end + trailingLength, appendedConfig };
