@@ -1229,3 +1229,64 @@ test("authenticated shutdown requires a verified idle drain", async () => {
     await server.stop(true);
   }
 });
+
+test("a client that goes away mid-turn is named instead of ending the turn silently", async () => {
+  // A disconnect used to leave no trace, so the abort it caused read downstream as the model going
+  // quiet. Naming it is what separates a bridge or proxy closing the stream from a turn that ended
+  // on its own — and the reason is reduced to a safe name and code, never a payload.
+  const warnings: string[] = [];
+  const warn = console.warn;
+  console.warn = (message: unknown) => { warnings.push(String(message)); };
+  try {
+    const turns = new HttpTurnCounter();
+    const client = new AbortController();
+    const response = await turns.track(
+      async signal => new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          signal.addEventListener("abort", () => { controller.close(); }, { once: true });
+        },
+      })),
+      client.signal,
+      "darwin",
+      "responses",
+    );
+    expect(response.body).not.toBeNull();
+    client.abort(Object.assign(new Error("private client detail"), {
+      name: "AbortError",
+      code: "ECONNRESET",
+    }));
+    await waitForTurnCount(turns, 0);
+
+    const disconnects = warnings.filter(line => line.includes("http_client_disconnected"));
+    expect(disconnects).toHaveLength(1);
+    expect(JSON.parse(disconnects[0]!.replace("[codex-chatgpt-web] http_client_disconnected ", ""))).toEqual({
+      httpTurnId: 1,
+      endpoint: "responses",
+      reasonName: "AbortError",
+      reasonCode: "ECONNRESET",
+    });
+    expect(disconnects[0]).not.toContain("private client detail");
+  } finally {
+    console.warn = warn;
+  }
+});
+
+test("a turn whose client never disconnects reports no disconnect", async () => {
+  const warnings: string[] = [];
+  const warn = console.warn;
+  console.warn = (message: unknown) => { warnings.push(String(message)); };
+  try {
+    const turns = new HttpTurnCounter();
+    const response = await turns.track(
+      async () => new Response("done"),
+      new AbortController().signal,
+      "darwin",
+      "responses",
+    );
+    expect(await response.text()).toBe("done");
+    await waitForTurnCount(turns, 0);
+    expect(warnings.filter(line => line.includes("http_client_disconnected"))).toHaveLength(0);
+  } finally {
+    console.warn = warn;
+  }
+});

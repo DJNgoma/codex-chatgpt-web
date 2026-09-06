@@ -103,6 +103,31 @@ const reportHttpStreamFailure: HttpStreamFailureReporter = evidence => {
   console.warn(`[codex-chatgpt-web] http_stream_failed ${JSON.stringify(evidence)}`);
 };
 
+// A client that goes away mid-turn ends the turn silently: the abort that follows reads downstream
+// as "the model stopped" rather than as the request being cut, and nothing recorded which of the two
+// happened. Naming the disconnect is what separates a bridge or proxy closing the stream from a turn
+// that genuinely ended on its own. Reasons are reduced to a safe name/code, never a payload.
+function reportHttpClientDisconnect(
+  httpTurnId: number,
+  endpoint: HttpTrackedEndpoint,
+  reason: unknown,
+): void {
+  const candidate = reason !== null && typeof reason === "object"
+    ? reason as { name?: unknown; code?: unknown }
+    : {};
+  const evidence = {
+    httpTurnId,
+    endpoint,
+    reasonName: safeStreamErrorField(candidate.name, reason === undefined ? "none" : "Error"),
+    reasonCode: safeStreamErrorField(candidate.code, "unknown"),
+  };
+  try {
+    console.warn(`[codex-chatgpt-web] http_client_disconnected ${JSON.stringify(evidence)}`);
+  } catch {
+    // Diagnostics are a side channel and must never take the turn down with them.
+  }
+}
+
 function emitHttpStreamFailure(
   reporter: HttpStreamFailureReporter,
   evidence: HttpStreamFailureEvidence,
@@ -215,9 +240,14 @@ export class HttpTurnCounter {
       if (streamAbortListener) abort.signal.removeEventListener("abort", streamAbortListener);
       finish();
     };
-    clientAbortListener = () => abort.abort(clientSignal?.reason);
-    if (clientSignal?.aborted) abort.abort(clientSignal.reason);
-    else clientSignal?.addEventListener("abort", clientAbortListener, { once: true });
+    clientAbortListener = () => {
+      reportHttpClientDisconnect(id, endpoint, clientSignal?.reason);
+      abort.abort(clientSignal?.reason);
+    };
+    if (clientSignal?.aborted) {
+      reportHttpClientDisconnect(id, endpoint, clientSignal.reason);
+      abort.abort(clientSignal.reason);
+    } else clientSignal?.addEventListener("abort", clientAbortListener, { once: true });
 
     try {
       const response = await run(abort.signal, identity => {

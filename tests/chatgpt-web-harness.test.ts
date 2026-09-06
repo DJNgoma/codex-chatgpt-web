@@ -6,7 +6,12 @@ import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { buildResponseJSON } from "../src/bridge";
-import { ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
+import {
+  ChatGptWebAdapterError,
+  chatGptTurnAbortError,
+  chatGptTurnRetiredError,
+  isChatGptTurnRetired,
+} from "../src/adapters/chatgpt-web/adapter-error";
 import { ChatGptCompletionTracker, chatGptImageFilePayloads, chatGptPromptFilePayloads, chatGptTurnIsComplete } from "../src/adapters/chatgpt-web/browser-worker";
 import { ChatGptBrowserWorker, type BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptConversationKey } from "../src/adapters/chatgpt-web/conversation-key";
@@ -3410,10 +3415,12 @@ describe("ChatGPT outer-native harness v4", () => {
       expect(retiredProgress?.activeToolCalls).toBe(0);
       expect(lateAcknowledgementError?.message).toContain("retired the turn binding");
       expect(events.some(event => event.type === "tool_call_start")).toBeFalse();
-      expect(events.at(-1)).toMatchObject({
-        type: "error",
-        code: "chatgpt_submitted_turn_failed",
-      });
+      // The Codex side retired this binding, so the turn must not be reported as ChatGPT going
+      // quiet: that message sends the user to the one component that was still working.
+      const failure = events.at(-1) as { type: string; code: string; message: string };
+      expect(failure).toMatchObject({ type: "error", code: "chatgpt_turn_retired" });
+      expect(failure.message).toContain("The Codex request for this turn ended");
+      expect(failure.message).not.toContain("ChatGPT stopped responding");
     } finally {
       (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
       chatGptTurnSessions.clear();
@@ -3848,4 +3855,38 @@ describe("adapter liveness covers every path through a turn", () => {
     expect(heartbeats.length).toBeGreaterThanOrEqual(2);
     expect(heartbeats.at(-1)).toBeGreaterThanOrEqual(CHATGPT_WEB_ADAPTER_HEARTBEAT_MS);
   }, 40_000);
+});
+
+test("an abort carries its reason, so a retired turn is not reported as ChatGPT going quiet", () => {
+  // index.ts knows exactly why it aborted; every abort path used to throw a fresh AbortError and
+  // drop signal.reason, so a turn the Codex side retired reached the reporter identical to one
+  // ChatGPT abandoned — and the single message they shared sent the user to the ChatGPT tab.
+  const controller = new AbortController();
+  const retirement = chatGptTurnRetiredError("Codex Native retired the turn binding before its tool work completed");
+  controller.abort(retirement);
+
+  const aborted = chatGptTurnAbortError(controller.signal);
+  expect(aborted.name).toBe("AbortError");
+  expect(aborted.message).toBe("ChatGPT web turn aborted");
+  expect((aborted as { cause?: unknown }).cause).toBe(retirement);
+
+  expect(isChatGptTurnRetired(aborted)).toBe(true);
+  expect(isChatGptTurnRetired(new Error("wrapped", { cause: aborted }))).toBe(true);
+  expect(isChatGptTurnRetired(new Error("an ordinary browser failure"))).toBe(false);
+});
+
+test("an abort with no reason of its own stays an ordinary abort", () => {
+  const controller = new AbortController();
+  controller.abort();
+  const aborted = chatGptTurnAbortError(controller.signal);
+  expect(aborted.name).toBe("AbortError");
+  expect(isChatGptTurnRetired(aborted)).toBe(false);
+  expect(isChatGptTurnRetired(chatGptTurnAbortError(undefined))).toBe(false);
+});
+
+test("a cyclic cause chain cannot trap the retirement check", () => {
+  const first = new Error("first");
+  const second = new Error("second", { cause: first });
+  (first as { cause?: unknown }).cause = second;
+  expect(isChatGptTurnRetired(first)).toBe(false);
 });
