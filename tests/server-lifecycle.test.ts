@@ -9,11 +9,37 @@ import { ChatGptTextFeed, ChatGptTraceFeed, chatGptTurnSessions } from "../src/a
 import { callTurnBroker, closeTurnBrokers, RemoteTurnBroker, TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
 import { defaultBrokerEndpoint, defaultConfig, providerConfig } from "../src/config";
 import { parseRequest } from "../src/responses/parser";
-import { compactRequest, HttpTurnCounter, responseRequest, routeChatGptWebRequest, startServer } from "../src/server";
+import { compactRequest, HttpTurnCounter, ModelCatalogFetches, responseRequest, routeChatGptWebRequest, startServer } from "../src/server";
 
 test("DEV harness configuration cannot bind a Responses listener", () => {
   const config = { ...defaultConfig("browser-only"), purpose: "dev-harness" as const, port: 0 };
   expect(() => startServer(config)).toThrow("cannot start a Responses listener");
+});
+
+test("Luna Bigger Context reaches the adapter for every Free route and response mode", async () => {
+  for (const mode of ["browser-only", "full"] as const) for (const stream of [false, true]) {
+    for (const model of ["chatgpt-web/gpt-5.6-luna", "chatgpt-web/luna", "chatgpt-web/think"]) {
+      const config = { ...defaultConfig(mode), solAvailable: false, experimentalBiggerContext: true };
+      let adapterStarted = false;
+      const response = await responseRequest(new Request("http://127.0.0.1/v1/responses", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model, input: "hello", stream }),
+      }), config, () => ({
+        name: "luna-bigger-context-test",
+        async runTurn(parsed, _incoming, emit) {
+          adapterStarted = true;
+          expect(parsed.modelId).toBe("gpt-5.6-luna");
+          emit({ type: "text_delta", text: "ready", phase: "final_answer" });
+          emit({ type: "done", stopReason: "stop", endTurn: true,
+            usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, estimated: true } });
+        },
+      }));
+      expect(response.status).toBe(200);
+      expect(await response.text()).toContain("ready");
+      expect(adapterStarted).toBeTrue();
+    }
+  }
 });
 
 async function waitForTurnCount(turns: HttpTurnCounter, expected: number): Promise<void> {
@@ -714,7 +740,8 @@ test("authenticated lifecycle control cancels orphaned browser turns", async () 
   }
 });
 
-test("authenticated targeted cancellation terminates one browser trace without reopening it", async () => {
+for (const reason of [undefined, "browser_surface_bootstrap_timeout", "helper_heartbeat_expired"] as const)
+test(`targeted cancellation preserves peer turns and its cause: ${reason ?? "user close"}`, async () => {
   const config = { ...defaultConfig("browser-only"), port: 0 };
   const server = startServer(config);
   chatGptTurnSessions.clear();
@@ -722,15 +749,17 @@ test("authenticated targeted cancellation terminates one browser trace without r
   let targetCancelled = 0;
   let otherCancelled = 0;
   const targetBrowser = new Promise<string>((_resolve, reject) => { rejectTarget = reject; });
+  let releaseHelper!: () => void;
+  const helperCleanup = new Promise<void>(resolve => { releaseHelper = resolve; });
   const target = chatGptTurnSessions.getOrCreate("target-key", () => ({
     mode: "read-only",
     browser: targetBrowser,
-    physicalSettlement: targetBrowser.then(() => undefined, () => undefined),
+    physicalSettlement: reason ? targetBrowser.then(() => undefined, () => undefined) : helperCleanup,
     trace: new ChatGptTraceFeed(),
     text: new ChatGptTextFeed(),
-    cancel: () => {
+    cancel: reason => {
       targetCancelled += 1;
-      rejectTarget(new Error("tab closed"));
+      rejectTarget(reason ?? new Error("tab closed"));
     },
   }), "trace_target");
   chatGptTurnSessions.getOrCreate("other-key", () => ({
@@ -746,17 +775,18 @@ test("authenticated targeted cancellation terminates one browser trace without r
     const unauthorized = await fetch(`http://127.0.0.1:${server.port}/admin/cancel-turn`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: "Bearer invalid" },
-      body: JSON.stringify({ traceId: "trace_target" }),
+      body: JSON.stringify({ traceId: "trace_target", ...(reason ? { reason } : {}) }),
     });
     expect(unauthorized.status).toBe(401);
 
     const response = await fetch(`http://127.0.0.1:${server.port}/admin/cancel-turn`, {
       method: "POST",
+      signal: AbortSignal.timeout(1_000),
       headers: {
         "content-type": "application/json",
         authorization: `Bearer ${config.controlToken}`,
       },
-      body: JSON.stringify({ traceId: "trace_target" }),
+      body: JSON.stringify({ traceId: "trace_target", ...(reason ? { reason } : {}) }),
     });
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({
@@ -764,15 +794,17 @@ test("authenticated targeted cancellation terminates one browser trace without r
       trace_id: "trace_target",
       cancelled_browser_turns: 1,
       cancelled_broker_turns: 0,
-      active_browser_turns: 1,
+      // The receipt acknowledges cancellation before the browser's promise microtasks settle.
+      active_browser_turns: reason ? 1 : 2,
     });
     expect(targetCancelled).toBe(1);
     expect(otherCancelled).toBe(0);
-    expect(target.settledOutcome()).toMatchObject({ type: "error" });
+    expect(target.settledOutcome()).toMatchObject({ type: "error", error: { code: reason ?? "client_cancelled", retryable: false } });
     expect(chatGptTurnSessions.getOrCreate("target-key", () => {
       throw new Error("cancelled trace must remain terminal");
     }, "trace_target")).toBe(target);
   } finally {
+    releaseHelper();
     chatGptTurnSessions.clear();
     await server.stop(true);
   }
@@ -963,7 +995,7 @@ test("a restart recovery turn without a new user instruction fails terminally in
   expect(adapterConstructions).toBe(0);
 });
 
-test("authenticated lifecycle control aborts active HTTP work before acknowledging cancellation", async () => {
+test.each(["alpha/search", "images/generations"])("authenticated lifecycle control aborts active %s before acknowledging cancellation", async path => {
   const config = { ...defaultConfig("browser-only"), port: 0 };
   let upstreamAbortObserved = false;
   const server = startServer(config, {
@@ -975,13 +1007,15 @@ test("authenticated lifecycle control aborts active HTTP work before acknowledgi
     }),
   });
   const endpoint = `http://127.0.0.1:${server.port}`;
-  const activeRequest = fetch(`${endpoint}/v1/alpha/search`, {
+  const activeRequest = fetch(`${endpoint}/v1/${path}`, {
     method: "POST",
     headers: {
       authorization: "Bearer test-codex-session",
       "content-type": "application/json",
     },
-    body: JSON.stringify({ query: "retained turn" }),
+    body: JSON.stringify(path === "alpha/search"
+      ? { query: "retained turn" }
+      : { model: "gpt-image-1", prompt: "A blue square" }),
   }).catch(() => null);
 
   try {
@@ -1177,6 +1211,79 @@ test("server exposes authenticated standalone Web Search on the routed v1 base U
   }
 });
 
+test("standalone native image generation and edits preserve their upstream protocol", async () => {
+  const config = { ...defaultConfig("browser-only"), port: 0 };
+  const requests: Request[] = [];
+  const reply = '{ "created": 1778832973, "data": [{ "b64_json": "native-image-bytes" }] }';
+  const denied = '{ "error": { "code": "rate_limit_exceeded", "message": "Image allowance reached" } }';
+  const upstreamServer = Bun.serve({
+    port: 0,
+    fetch: request => {
+      const edit = new URL(request.url).pathname.endsWith("/edits");
+      return new Response(Bun.gzipSync(edit ? denied : reply), {
+        status: edit ? 429 : 200,
+        headers: {
+          "content-type": "application/json", "content-encoding": "gzip",
+          "x-codex-imagegen-request-id": "native-image-request",
+        },
+      });
+    },
+  });
+  const server = startServer(config, {
+    fetchUpstream: async request => {
+      requests.push(request);
+      const path = new URL(request.url).pathname;
+      return fetch(new Request(`http://127.0.0.1:${upstreamServer.port}${path}`, request.clone()));
+    },
+  });
+  const endpoint = `http://127.0.0.1:${server.port}`;
+  try {
+    for (const operation of ["generations", "edits"] as const) {
+      const body = operation === "generations"
+        ? '{ "model": "gpt-image-1", "prompt": "A blue square", "n": 1 }'
+        : '{ "model": "gpt-image-1", "prompt": "Make it green", "images": [{ "image_url": "data:image/png;base64,AAAA" }] }';
+      const response = await fetch(`${endpoint}/v1/images/${operation}?fixture=1`, {
+        method: "POST",
+        headers: {
+          authorization: "Bearer test-codex-session",
+          "content-type": "application/json",
+          "chatgpt-account-id": "test-account",
+          "x-codex-image-turn-id": "native-image-turn",
+        },
+        body,
+      });
+      expect(response.status).toBe(operation === "generations" ? 200 : 429);
+      expect(await response.text()).toBe(operation === "generations" ? reply : denied);
+      expect(response.headers.get("content-encoding")).toBeNull();
+      expect(response.headers.get("x-codex-imagegen-request-id")).toBe("native-image-request");
+      const upstream = requests.at(-1)!;
+      expect(upstream.url).toBe(`https://chatgpt.com/backend-api/codex/images/${operation}?fixture=1`);
+      expect(upstream.method).toBe("POST");
+      expect(upstream.redirect).toBe("manual");
+      expect(upstream.headers.get("authorization")).toBe("Bearer test-codex-session");
+      expect(upstream.headers.get("chatgpt-account-id")).toBe("test-account");
+      expect(upstream.headers.get("x-codex-image-turn-id")).toBe("native-image-turn");
+      expect(upstream.headers.get("host")).toBeNull();
+      expect(await upstream.text()).toBe(body);
+    }
+    expect(requests).toHaveLength(2);
+    const unauthorized = await fetch(`${endpoint}/v1/images/generations`, { method: "POST", body: "{}" });
+    expect(unauthorized.status).toBe(401);
+    expect(requests).toHaveLength(2);
+    await fetch(`${endpoint}/admin/drain`, {
+      method: "POST", headers: { authorization: `Bearer ${config.controlToken}` },
+    });
+    const drained = await fetch(`${endpoint}/v1/images/edits`, {
+      method: "POST", headers: { authorization: "Bearer test-codex-session" }, body: "{}",
+    });
+    expect(drained.status).toBe(503);
+    expect(requests).toHaveLength(2);
+  } finally {
+    await server.stop(true);
+    await upstreamServer.stop(true);
+  }
+});
+
 test("authenticated shutdown requires a verified idle drain", async () => {
   const config = { ...defaultConfig("browser-only"), port: 0 };
   const server = startServer(config);
@@ -1288,5 +1395,273 @@ test("a turn whose client never disconnects reports no disconnect", async () => 
     expect(warnings.filter(line => line.includes("http_client_disconnected"))).toHaveLength(0);
   } finally {
     console.warn = warn;
+  }
+});
+
+test("model catalog health distinguishes no request, transport failure, upstream denial, and recovery without secrets", async () => {
+  let outcome: "transport" | "denied" | "invalid" | "ready" = "transport";
+  const server = startServer({ ...defaultConfig("browser-only"), port: 0 }, {
+    fetchUpstream: async () => {
+      if (outcome === "transport") throw Object.assign(new Error("private proxy credentials and host"), { code: "UnsupportedProxyProtocol" });
+      if (outcome === "denied") return new Response("private upstream account detail", { status: 403 });
+      if (outcome === "invalid") return Response.json({ models: [] });
+      return Response.json({ models: [{ slug: "native", visibility: "list", supported_reasoning_levels: [] }] });
+    },
+  });
+  const base = `http://127.0.0.1:${server.port}`;
+  const health = async () => await (await fetch(`${base}/healthz`)).json() as Record<string, any>;
+  try {
+    expect(await health()).toMatchObject({ model_catalog_requests: 0, last_model_catalog_result: null });
+    const unauthenticated = await fetch(`${base}/v1/models`);
+    expect(unauthenticated.status).toBe(502);
+    await unauthenticated.text();
+    expect((await health()).last_model_catalog_result.failure.stage).toBe("request");
+    for (const [next, status, stage] of [
+      ["transport", 502, "transport"], ["denied", 403, "upstream"], ["invalid", 502, "catalog"], ["ready", 200, undefined],
+    ] as const) {
+      outcome = next;
+      const response = await fetch(`${base}/v1/models`, { headers: { authorization: "Bearer private-session-token" } });
+      expect(response.status).toBe(status);
+      await response.text();
+      const snapshot = await health();
+      expect(snapshot.last_model_catalog_result).toMatchObject({ status });
+      expect(snapshot.last_model_catalog_result.failure?.stage).toBe(stage);
+      if (next === "transport") expect(snapshot.last_model_catalog_result.failure.code).toBe("UnsupportedProxyProtocol");
+      expect(JSON.stringify(snapshot)).not.toContain("private");
+      expect(snapshot.successful_model_catalog_requests).toBe(next === "ready" ? 1 : 0);
+    }
+    expect((await health()).model_catalog_requests).toBe(5);
+  } finally {
+    await server.stop(true);
+  }
+});
+
+
+test("a cancelled model request does not replace health from the last completed request", async () => {
+  let entered!: () => void;
+  const ready = new Promise<void>(resolve => { entered = resolve; });
+  let abortObserved!: () => void;
+  const aborted = new Promise<void>(resolve => { abortObserved = resolve; });
+  let pending = false;
+  const server = startServer({ ...defaultConfig("browser-only"), port: 0 }, {
+    // An abandoned upstream attempt is normally kept for the client's retry (#696).
+    modelCatalogFetches: new ModelCatalogFetches(0),
+    fetchUpstream: async request => {
+      if (!pending) return new Response("Denied", { status: 403 });
+      entered();
+      return await new Promise<Response>((_resolve, reject) => {
+        const cancel = () => { abortObserved(); reject(new DOMException("cancel", "AbortError")); };
+        if (request.signal.aborted) cancel();
+        else request.signal.addEventListener("abort", cancel, { once: true });
+      });
+    },
+  });
+  const base = `http://127.0.0.1:${server.port}`;
+  const headers = { authorization: "Bearer fixture" };
+  const health = async () => await (await fetch(`${base}/healthz`)).json() as Record<string, any>;
+  try {
+    await (await fetch(`${base}/v1/models`, { headers })).text();
+    const before = (await health()).last_model_catalog_result;
+    pending = true;
+    const controller = new AbortController();
+    const request = fetch(`${base}/v1/models`, { headers, signal: controller.signal }).catch(() => undefined);
+    await ready;
+    controller.abort();
+    await request;
+    await aborted;
+    const after = await health();
+    expect(after.last_model_catalog_result).toEqual(before);
+    expect(after.successful_model_catalog_requests).toBe(0);
+    expect(after.model_catalog_requests).toBe(2);
+  } finally { await server.stop(true); }
+});
+
+// The security model treats websites as untrusted, yet any page can POST to a loopback port
+// (cross-site, or same-origin after DNS rebinding). Browsers attach Origin to those requests.
+test("a web page cannot start or control turns through the loopback route", async () => {
+  let adapterTurns = 0;
+  const server = startServer({ ...defaultConfig("browser-only"), port: 0, solAvailable: false }, {
+    adapterFactory: () => ({
+      name: "browser-origin-test",
+      async runTurn(_parsed, _incoming, emit) {
+        adapterTurns += 1;
+        emit({ type: "text_delta", text: "ready", phase: "final_answer" });
+        emit({ type: "done", stopReason: "stop", endTurn: true,
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, estimated: true } });
+      },
+    }),
+  });
+  const base = `http://127.0.0.1:${server.port}`;
+  const body = JSON.stringify({ model: "chatgpt-web/gpt-5.6-luna", input: "hello", stream: false });
+  try {
+    for (const origin of ["https://attacker.example", `http://rebound.example:${server.port}`, "null"]) {
+      for (const path of ["/v1/responses", "/v1/responses/compact", "/v1/alpha/search", "/admin/cancel-turns"]) {
+        // A no-cors page can only send a simple content type; the JSON body is parsed regardless.
+        const response = await fetch(`${base}${path}`, {
+          method: "POST", headers: { origin, "content-type": "text/plain" }, body,
+        });
+        expect(response.status).toBe(403);
+        expect(await response.text()).toContain("Browser-originated");
+      }
+    }
+    expect(adapterTurns).toBe(0);
+
+    // Codex and the launcher are not browsers: their requests carry no Origin and are unchanged.
+    const native = await fetch(`${base}/v1/responses`, {
+      method: "POST", headers: { "content-type": "application/json" }, body,
+    });
+    expect(native.status).toBe(200);
+    expect(await native.text()).toContain("ready");
+    expect(adapterTurns).toBe(1);
+    // Read-only negotiation and health stay reachable so transport selection is unaffected.
+    expect((await fetch(`${base}/v1/responses`, { headers: { origin: "https://attacker.example" } })).status).toBe(426);
+    expect((await fetch(`${base}/healthz`, { headers: { origin: "https://attacker.example" } })).status).toBe(200);
+  } finally {
+    await server.stop(true);
+  }
+});
+
+// #696: Codex abandons a catalog request after five seconds and retries. On a network whose first
+// HTTPS connection takes longer, cancelling upstream with each attempt made every retry start over.
+test("a catalog request that outlives the client's deadline completes for its retry", async () => {
+  let upstreamCalls = 0;
+  let upstreamAborts = 0;
+  const server = startServer({ ...defaultConfig("browser-only"), port: 0 }, {
+    fetchUpstream: async request => {
+      upstreamCalls += 1;
+      await new Promise<void>((resolve, reject) => {
+        const connected = setTimeout(resolve, 400);
+        request.signal.addEventListener("abort", () => {
+          upstreamAborts += 1;
+          clearTimeout(connected);
+          reject(new DOMException("cancel", "AbortError"));
+        }, { once: true });
+      });
+      return Response.json({ models: [{ slug: "native", visibility: "list", supported_reasoning_levels: [] }] });
+    },
+  });
+  const base = `http://127.0.0.1:${server.port}`;
+  const attempt = async (): Promise<number | "abandoned"> => {
+    try {
+      const response = await fetch(`${base}/v1/models?client_version=1.2.3`, {
+        headers: { authorization: "Bearer fixture" }, signal: AbortSignal.timeout(150),
+      });
+      await response.text();
+      return response.status;
+    } catch {
+      return "abandoned";
+    }
+  };
+  try {
+    const attempts: Array<number | "abandoned"> = [];
+    while (attempts.length < 6 && attempts.at(-1) !== 200) attempts.push(await attempt());
+    expect(attempts.at(-1)).toBe(200);
+    expect(attempts.slice(0, -1).every(result => result === "abandoned")).toBeTrue();
+    // Before the fix every abandoned attempt cancelled and restarted its own upstream request.
+    expect(upstreamAborts).toBe(0);
+    expect(upstreamCalls).toBeLessThan(attempts.length);
+    const health = await (await fetch(`${base}/healthz`)).json() as Record<string, any>;
+    expect(health.successful_model_catalog_requests).toBe(1);
+    expect(health.last_model_catalog_result).toMatchObject({ status: 200 });
+  } finally {
+    await server.stop(true);
+  }
+});
+
+test("shared catalog attempts stay bound to one request identity and are final once delivered", async () => {
+  const catalog = { models: [{ slug: "native", visibility: "list", supported_reasoning_levels: [] }] };
+  const upstream: Array<{ authorization: string | null; aborted: boolean; respond: (response: Response) => void }> = [];
+  const server = startServer({ ...defaultConfig("browser-only"), port: 0 }, {
+    fetchUpstream: request => new Promise<Response>((resolve, reject) => {
+      const call = { authorization: request.headers.get("authorization"), aborted: false, respond: resolve };
+      upstream.push(call);
+      request.signal.addEventListener("abort", () => {
+        call.aborted = true;
+        reject(new DOMException("cancel", "AbortError"));
+      }, { once: true });
+    }),
+  });
+  const base = `http://127.0.0.1:${server.port}`;
+  const get = (token: string, signal?: AbortSignal) => fetch(`${base}/v1/models`, {
+    headers: { authorization: `Bearer ${token}` }, ...(signal ? { signal } : {}),
+  });
+  // A request is counted in the same tick in which it joins or starts its upstream attempt.
+  const received = async (count: number) => {
+    for (let waited = 0; waited < 2_000; waited += 5) {
+      const health = await (await fetch(`${base}/healthz`)).json() as { model_catalog_requests: number };
+      if (health.model_catalog_requests >= count) return;
+      await Bun.sleep(5);
+    }
+    throw new Error(`Expected ${count} catalog requests`);
+  };
+  try {
+    // Identical concurrent requests share one attempt; another account never does.
+    const [first, second, other] = [get("account-a"), get("account-a"), get("account-b")];
+    await received(3);
+    expect(upstream.map(call => call.authorization).sort()).toEqual(["Bearer account-a", "Bearer account-b"]);
+    upstream.find(call => call.authorization === "Bearer account-b")!.respond(new Response("Denied", { status: 403 }));
+    upstream.find(call => call.authorization === "Bearer account-a")!.respond(Response.json(catalog));
+    expect([(await first).status, (await second).status, (await other).status]).toEqual([200, 200, 403]);
+
+    // A delivered result and a failure are both final: the next request asks upstream again.
+    const repeated = get("account-b");
+    await received(4);
+    expect(upstream.length).toBe(3);
+    upstream[2]!.respond(Response.json(catalog));
+    expect((await repeated).status).toBe(200);
+  } finally {
+    await server.stop(true);
+  }
+});
+
+test("an abandoned catalog attempt serves the retry once and is cancelled when nobody returns", async () => {
+  const fetches = new ModelCatalogFetches(40, 500);
+  const upstream: Array<{ signal: AbortSignal; respond: () => void }> = [];
+  const forward = (request: Request, markSent: () => void) => new Promise<Response>((resolve, reject) => {
+    markSent();
+    upstream.push({ signal: request.signal, respond: () => resolve(Response.json({ models: [] })) });
+    request.signal.addEventListener("abort", () => reject(request.signal.reason), { once: true });
+  });
+  const request = (signal?: AbortSignal) => new Request("http://127.0.0.1/v1/models", {
+    headers: { authorization: "Bearer fixture" }, ...(signal ? { signal } : {}),
+  });
+  const abandon = async () => {
+    const client = new AbortController();
+    const waiting = fetches.fetch(request(client.signal), forward);
+    client.abort();
+    expect(await waiting).toMatchObject({ ok: false, sent: true });
+  };
+  try {
+    // The client gives up; its upstream attempt keeps running and the retry joins it.
+    await abandon();
+    expect(upstream.length).toBe(1);
+    expect(upstream[0]!.signal.aborted).toBeFalse();
+    const retry = fetches.fetch(request(), forward);
+    upstream[0]!.respond();
+    expect(await retry).toMatchObject({ ok: true, status: 200 });
+    expect(upstream.length).toBe(1);
+
+    // Completed with nobody waiting: the next request takes that result once, then asks again.
+    await abandon();
+    upstream[1]!.respond();
+    await Bun.sleep(5);
+    expect(await fetches.fetch(request(), forward)).toMatchObject({ ok: true, status: 200 });
+    expect(upstream.length).toBe(2);
+    const fresh = fetches.fetch(request(), forward);
+    expect(upstream.length).toBe(3);
+    upstream[2]!.respond();
+    expect(await fresh).toMatchObject({ ok: true });
+
+    // Nobody returns: the attempt is cancelled, and a later request starts a new one.
+    await abandon();
+    await Bun.sleep(120);
+    expect(upstream[3]!.signal.aborted).toBeTrue();
+    const later = fetches.fetch(request(), forward);
+    expect(upstream.length).toBe(5);
+    upstream[4]!.respond();
+    expect(await later).toMatchObject({ ok: true });
+    expect(upstream.filter(call => call.signal.aborted).length).toBe(1);
+  } finally {
+    fetches.close();
   }
 });

@@ -134,3 +134,32 @@ active use.
 ## Assistance acknowledgement
 
 Prepared with assistance from ChatGPT Web GPT-6 Pro.
+
+## 13 October 2026 integration
+
+Merged upstream main `0b6087c` (6.1.8) into the personal fork. Backup branch:
+`backup/pre-6.1.8-20261013`. Upstream now owns passkey handoff, authentication
+recovery, and semantic Interrupt hook ownership; the older fork variants were
+retired. The fork retains read-only external catalogue checks, catalogue evidence
+provenance, and specific turn retirement/abort messages. Catalogue request errors
+are reported without treating a failed request as successful route verification.
+
+The launcher uses patched `smol-toml` 1.9.1. CodexDesktopPatches supplies explicit
+GPT-5.6 family routes for its named 5.6 Sol row; historical aliases retain generic
+profiles. The local provider IDs, default provider, and config remain owned by
+CodexDesktopPatches. Do not run upstream setup to replace them.
+
+Validation: runtime suite initially 938 passed, 60 skipped, one outdated guard-order
+assertion failed. The catalogue-ownership test now isolates that guard using the
+built-in provider; the 49 integration tests pass. Launcher suite: 444 passed,
+one skipped. Runtime/launcher type checks, renderer build, relocatable runtime
+smoke and runtime dependency audit pass. The launcher audit also passes after the
+parser upgrade. Packaging verifies the macOS signature and bundled runtime.
+Browser fixture skips do not establish authenticated account/model execution.
+
+Installed-app validation caught the upstream custom-provider startup guard. The
+fork accepts an existing managed route behind `local_model_bridge` only when its
+provider URL is exactly http://127.0.0.1:48111/v1 and a bounded readable external
+catalogue contains visible ChatGPT Web entries. Other custom providers and new
+foreign-catalogue installs remain guarded. Tests cover healthy startup/preflight,
+provider/port mismatches, hidden/empty/malformed catalogues, and config preservation.

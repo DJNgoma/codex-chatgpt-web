@@ -1,5 +1,5 @@
-import { existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { isAbsolute, resolve } from "node:path";
 import {
   CODEX_REALTIME_WEBRTC_CALL_BASE_URL,
   MANAGED_COMMENT,
@@ -166,8 +166,40 @@ export function managedJournalIsActive(journal: ManagedRouteJournal): boolean {
 }
 
 export function verifyManagedJournalState(text: string, journal: ManagedRouteJournal): void {
-  if (journal.version === 3 || journal.active) verifyInstalledRoute(text, journal);
+  // Recovery selects the journal that owns the physical edits, even if a user-selected
+  // provider now bypasses the bridge. That installation must remain removable.
+  if (journal.version === 3 || journal.active) verifyOwnedInstalledRoute(text, journal);
   else verifyRestoredRoute(text, journal);
+}
+
+// This fork also serves the existing CodexDesktopPatches proxy. Its picker is
+// external, and the proxy forwards Web requests to this launcher. Recognize only
+// the known loopback provider with visible Web catalogue entries; setup's foreign
+// catalogue guard still prevents a new integration from taking over its picker.
+export function isLocalCatalogProxy(text: string): boolean {
+  try {
+    const config = Bun.TOML.parse(splitLines(text).join("\n")) as Record<string, any>;
+    if (config.model_provider !== "local_model_bridge"
+      || config.model_providers?.local_model_bridge?.base_url !== "http://127.0.0.1:48111/v1"
+      || typeof config.model_catalog_json !== "string"
+      || !isAbsolute(config.model_catalog_json)) return false;
+    const stat = statSync(config.model_catalog_json);
+    if (!stat.isFile() || stat.size > 4 * 1024 * 1024) return false;
+    const catalog = JSON.parse(readFileSync(config.model_catalog_json, "utf8"));
+    return Array.isArray(catalog.models) && catalog.models.some((row: any) =>
+      typeof row?.slug === "string" && row.slug.startsWith("chatgpt-web-") && row.visibility !== "hide");
+  } catch { return false; }
+}
+
+export function assertBuiltinModelProvider(text: string): void {
+  const { model_provider: provider } = Bun.TOML.parse(splitLines(text).join("\n")) as { model_provider?: unknown };
+  if (provider !== undefined && provider !== "openai" && !isLocalCatalogProxy(text)) {
+    throw new Error(
+      "Codex model_provider selects a custom provider; the bridge requires the built-in openai provider "
+      + "or the verified CodexDesktopPatches local catalogue proxy. "
+      + "--replace-codex-route only replaces the route URL; it does not change your provider configuration.",
+    );
+  }
 }
 
 export function replacementBaseline(
@@ -180,7 +212,7 @@ export function replacementBaseline(
 
   if (journal.version === 9 || journal.version === 10) {
     const withoutHook = journal.version === 10
-      ? restoreCodexInterruptHook(currentText, journal.interruptHook)
+      ? restoreCodexInterruptHook(currentText, journal.interruptHook, { allowAbsent: true })
       : currentText;
     const baseline = restoreOwnedManagedFeatures(withoutHook, journal);
     const document = parseDocument(baseline);
@@ -237,6 +269,7 @@ export function installRoute(
   previous: CodexIntegrationJournal["previous"];
   previousRealtimeWebrtcCallBaseUrl: PreviousAssignment;
 } {
+  assertBuiltinModelProvider(text);
   const document = parseDocument(text);
   const previous = assignments(document.lines);
   if (previous.openai_base_url.present && !replaceExistingRoute) {
@@ -304,6 +337,11 @@ export function installRoute(
 }
 
 export function verifyInstalledRoute(text: string, journal: ManagedRouteJournal): void {
+  verifyOwnedInstalledRoute(text, journal);
+  assertBuiltinModelProvider(text);
+}
+
+function verifyOwnedInstalledRoute(text: string, journal: ManagedRouteJournal): void {
   const lines = splitLines(text);
   const current = assignments(lines);
   if (current.openai_base_url.value !== journal.installed.openai_base_url) {
@@ -453,7 +491,7 @@ export function assertPreservedPreviousRealtimeAssignment(
 }
 
 export function restoreManagedRoute(text: string, journal: ManagedRouteJournal): string {
-  verifyInstalledRoute(text, journal);
+  verifyOwnedInstalledRoute(text, journal);
   const withoutHook = journal.version === 10
     ? restoreCodexInterruptHook(text, journal.interruptHook)
     : text;

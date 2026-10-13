@@ -22,8 +22,99 @@ import {
   waitForLauncherManualTerminal,
 } from "../src/launcher-browser-host";
 import type { Browser, BrowserContext, Page } from "playwright-core";
+import { ChatGptBrowserWorker } from "../src/adapters/chatgpt-web/browser-worker";
 
 const roots: string[] = [];
+
+test("launcher activity follows actual send callbacks and current-turn tool counts", async () => {
+  const messages: Array<{ phase: string; progress?: { stage: string; activeToolCalls: number } }> = [];
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    const message = await request.json() as typeof messages[number];
+    messages.push(message);
+    return Response.json(message.phase === "start"
+      ? { surfaceId: "a".repeat(32), reused: false, connectorBound: false }
+      : { cancelledByUser: false });
+  } });
+  const waitForStage = async (stage: string) => {
+    const deadline = Date.now() + 1_000;
+    while (!messages.some(message => message.progress?.stage === stage) && Date.now() < deadline) await Bun.sleep(5);
+    expect(messages.some(message => message.progress?.stage === stage)).toBeTrue();
+  };
+  let activeToolCalls = 0;
+  let activated = 0;
+  let submitted = 0;
+  try {
+    const worker = Object.assign(Object.create(ChatGptBrowserWorker.prototype), {
+      config: { browserHost: "launcher", browserHostDescriptorPath: descriptorFile(`http://127.0.0.1:${server.port}`) },
+      runBrowserTurn: async (turn: { onSendActivated(): Promise<void>; onSubmitted(): Promise<void> }) => {
+        await waitForStage("preparing");
+        await turn.onSendActivated();
+        await waitForStage("sending");
+        activeToolCalls = 2;
+        await turn.onSubmitted();
+        await waitForStage("chatgpt");
+        return "done";
+      },
+    });
+    await expect(worker.runExclusive({
+      traceId: "activity-fixture", capabilities: { localToolsEnabled: true },
+      externalProgress: { snapshot: () => ({ activeToolCalls }) },
+      onSendActivated: () => { activated++; }, onSubmitted: () => { submitted++; },
+    })).resolves.toBe("done");
+    expect(messages.filter(message => message.progress).map(message => message.progress)).toEqual([
+      { stage: "preparing", activeToolCalls: 0 }, { stage: "sending", activeToolCalls: 0 },
+      { stage: "chatgpt", activeToolCalls: 2 },
+    ]);
+    expect(messages.at(-1)?.phase).toBe("end");
+    expect([activated, submitted]).toEqual([1, 1]);
+  } finally { server.stop(true); }
+});
+
+test("a blocked sign-in replaces an opaque navigation abort with a non-retryable session error", async () => {
+  let needsSignIn: unknown = true;
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(req) {
+    const activity = await req.json() as { phase: string };
+    return Response.json(activity.phase === "start"
+      ? { surfaceId: "a".repeat(32), reused: false, connectorBound: false }
+      : { cancelledByUser: false, authenticationRequired: needsSignIn });
+  } });
+  try {
+    const descriptor = descriptorFile(`http://127.0.0.1:${server.port}`);
+    const worker = Object.assign(Object.create(ChatGptBrowserWorker.prototype), {
+      config: { browserHost: "launcher", browserHostDescriptorPath: descriptor },
+      runBrowserTurn: async () => { throw new Error("page.goto: net::ERR_ABORTED"); },
+    });
+    const turn = { traceId: "auth-redirect", capabilities: { localToolsEnabled: false } };
+    await expect(worker.runExclusive(turn)).rejects.toMatchObject({
+      status: 401, code: "chatgpt_sign_in_required", retryable: false,
+    });
+    needsSignIn = false;
+    await expect(worker.runExclusive(turn)).rejects.toThrow("page.goto: net::ERR_ABORTED");
+    needsSignIn = "true";
+    await expect(notifyLauncherTurn(descriptor, { phase: "end", traceId: "auth-redirect", helperPid: process.pid, status: "failed" }))
+      .rejects.toThrow("invalid authentication state");
+  } finally { server.stop(true); }
+});
+
+test("startup waits beyond five seconds and distinguishes its deadline from caller cancellation", async () => {
+  let calls = 0;
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch() {
+    calls++;
+    await Bun.sleep(calls === 1 ? 5_100 : 80);
+    return Response.json({ surfaceId: "a".repeat(32), reused: false, connectorBound: false });
+  } });
+  try {
+    const descriptor = descriptorFile(`http://127.0.0.1:${server.port}`);
+    const activity = { phase: "start" as const, traceId: "bounded-start", helperPid: process.pid };
+    await expect(notifyLauncherTurn(descriptor, activity)).resolves.toMatchObject({ reused: false });
+    await expect(notifyLauncherTurn(descriptor, activity, 10)).rejects.toThrow("start timed out after 10ms");
+    const controller = new AbortController();
+    const pending = notifyLauncherTurn(descriptor, activity, undefined, controller.signal);
+    setTimeout(() => controller.abort(), 10);
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(calls).toBe(3);
+  } finally { server.stop(true); }
+}, 10_000);
 
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -38,7 +129,7 @@ function descriptorFile(
   roots.push(root);
   const path = join(root, "launcher-browser.json");
   writeFileSync(path, `${JSON.stringify({
-    version: 2,
+    version: 3,
     kind: LAUNCHER_BROWSER_HOST_KIND,
     profile,
     pid: process.pid,
@@ -56,6 +147,7 @@ function descriptorFile(
       : "persist:codex-web-gpt-chatgpt",
     idleUrl: LAUNCHER_BROWSER_IDLE_URL,
     surfaceId: "launcher_surface_id_0123456789AB",
+    surfaceTargets: { ["launcher_surface_id_0123456789AB"]: "native-owned-target" },
     createdAt: new Date().toISOString(),
   })}\n`, { mode: 0o600 });
   return path;
@@ -111,6 +203,7 @@ test("launcher turn control sends authenticated lifecycle events", async () => {
       surfaceId: "launcher_surface_id_0123456789AB",
       reused: true,
       connectorBound: true,
+      trackUsage: false,
     });
     expect(received.authorization).toBe("Bearer launcher-control-token-0123456789abcdefghijklmnop");
     expect(received.body).toEqual({
@@ -254,7 +347,7 @@ test("launcher session verification uses the authenticated control channel inste
       authenticated: true,
       temporary: true,
       solAvailable: true,
-      proAvailable: true,
+      extraHighAvailable: true, proAvailable: true,
       url: "https://chatgpt.com/?temporary-chat=true",
     }));
   });
@@ -268,7 +361,7 @@ test("launcher session verification uses the authenticated control channel inste
     const path = descriptorFile(`http://127.0.0.1:${address.port}`);
     expect(await inspectLauncherBrowserHost(path, { detectCapabilities: true })).toEqual({
       solAvailable: true,
-      proAvailable: true,
+      extraHighAvailable: true, proAvailable: true,
       url: "https://chatgpt.com/?temporary-chat=true",
     });
   } finally {
@@ -352,19 +445,31 @@ test("launcher profile checks reject cross-profile browser ownership", async () 
     .rejects.toThrow("belongs to development");
 });
 
-test("launcher page selection uses the owned surface marker instead of URL order", async () => {
+function nativeTargetContext(pages: Page[], targetId: (page: Page) => string): BrowserContext {
+  return {
+    pages: () => pages,
+    newCDPSession: async (page: Page) => ({
+      send: async (method: string) => {
+        expect(method).toBe("Target.getTargetInfo");
+        return { targetInfo: { targetId: targetId(page) } };
+      },
+      detach: async () => {},
+    }),
+  } as unknown as BrowserContext;
+}
+
+test("launcher page selection uses native ownership without evaluating unrelated renderers", async () => {
   const descriptor = readLauncherBrowserHostDescriptor(descriptorFile());
   const hiddenPage = {
     url: () => "https://chatgpt.com/?temporary-chat=true",
-    evaluate: async () => "another_surface_id_0123456789ABC",
+    evaluate: () => { throw new Error("Do not evaluate an unrelated renderer"); },
   } as unknown as Page;
   const ownedPage = {
     url: () => LAUNCHER_BROWSER_IDLE_URL,
-    evaluate: async () => descriptor.surfaceId,
+    evaluate: () => { throw new Error("Ownership comes from the native target"); },
   } as unknown as Page;
-  const context = {
-    pages: () => [hiddenPage, ownedPage],
-  } as unknown as BrowserContext;
+  const context = nativeTargetContext([hiddenPage, ownedPage],
+    page => page === ownedPage ? "native-owned-target" : "native-other-target");
   const browser = {
     contexts: () => [context],
   } as unknown as Browser;
@@ -375,14 +480,12 @@ test("launcher page selection uses the owned surface marker instead of URL order
   });
 });
 
-test("launcher page selection rejects duplicated ownership markers", async () => {
+test("launcher page selection rejects duplicated native target ownership", async () => {
   const descriptor = readLauncherBrowserHostDescriptor(descriptorFile());
   const page = () => ({
     evaluate: async () => descriptor.surfaceId,
   }) as unknown as Page;
-  const context = {
-    pages: () => [page(), page()],
-  } as unknown as BrowserContext;
+  const context = nativeTargetContext([page(), page()], () => "native-owned-target");
   const browser = {
     contexts: () => [context],
   } as unknown as Browser;
@@ -390,6 +493,20 @@ test("launcher page selection rejects duplicated ownership markers", async () =>
   expect(selectLauncherPage(browser, descriptor, 20)).rejects.toThrow(
     "2 surfaces with the same ownership id",
   );
+});
+
+test("launcher descriptor rejects ambiguous native targets and selection rejects retired surfaces", async () => {
+  const path = descriptorFile();
+  const descriptor = readLauncherBrowserHostDescriptor(path);
+  const duplicate = { ...descriptor, surfaceTargets: {
+    ...descriptor.surfaceTargets, ["x".repeat(32)]: "native-owned-target",
+  } };
+  writeFileSync(path, JSON.stringify(duplicate), { mode: 0o600 });
+  expect(() => readLauncherBrowserHostDescriptor(path)).toThrow("duplicated surface targets");
+  const browser = { contexts: () => [] } as unknown as Browser;
+  await expect(selectLauncherPage(browser, descriptor, 20, "retired".repeat(5))).rejects.toThrow("no longer registered");
+  writeFileSync(path, JSON.stringify({ ...descriptor, version: 2 }), { mode: 0o600 });
+  expect(() => readLauncherBrowserHostDescriptor(path)).toThrow("restart the updated launcher");
 });
 
 test("launcher page selection stops immediately when acquisition is aborted", async () => {

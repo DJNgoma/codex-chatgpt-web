@@ -6,7 +6,7 @@ import { existsSync, rmSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { stdin, stdout } from "node:process";
 import { captureSystemBrowserLoginToFile, checkBrowserEngine, loginToChatGpt } from "./browser-login";
-import { CHATGPT_CONNECTOR_NAME, defaultConfig, getConfigDir, getConfigPath, loadConfig, loadConfigForSetup } from "./config";
+import { defaultConfig, getConfigDir, getConfigPath, loadConfig, loadConfigForSetup } from "./config";
 import {
   inspectLauncherBrowserHost,
   inspectLauncherBrowserHostLiveness,
@@ -70,7 +70,6 @@ Setup options:
                                Use the embedded launcher browser described by this owner-only file
   --refresh-account-capabilities
                                Re-read the authenticated account's available Web models
-  --app-name NAME              Automatic-mode ChatGPT connector name (default: ${CHATGPT_CONNECTOR_NAME})
   --tunnel-id ID               Existing OpenAI tunnel id (full mode)
   --runtime-key-file PATH      File containing a Tunnels Read+Use runtime key
   --replace-codex-route        Reversibly replace existing Responses or Voice route settings
@@ -78,7 +77,15 @@ Setup options:
   --restart-service            Explicitly restart this project's daemon after an update
   --login                      Refresh the stored ChatGPT login even if one exists
   --auto-approve-tool-calls    Opt in to per-call browser clicks on "Allow once" prompts
-  --bigger-context             Enable experimental adaptive 1/2/3-message context
+  --bigger-context             Enable experimental adaptive 1/2/6-message context
+  --fresh-conversation         Start each automatic turn in a fresh browser chat
+  --retained-conversation      Reuse the browser chat between turns (default)
+  --saved-chats                Keep task conversations in ChatGPT history
+  --temporary-chats            Use Temporary Chat for task conversations (default)
+  --composer-predictions       Enable next-message suggestions using GPT-6 Sol Medium (default)
+  --no-composer-predictions    Disable next-message suggestions for Web models
+  --skill-attachments         Experimental selected skills as text attachments
+  --inline-skills             Keep selected skills inline (default)
   --standard-context           Disable experimental multi-message context
   --acknowledge-unofficial     Accept the one-time unofficial-browser-automation notice
 
@@ -252,7 +259,10 @@ async function loginCommand(args: string[]): Promise<void> {
       ...defaultConfig(),
       chromeExecutablePath,
       storageStatePath,
-    }, { continuation: continuation.promise });
+    }, {
+      continuation: continuation.promise,
+      onBrowserReady: () => { stdout.write(`${JSON.stringify({ version: 1, type: "passkey-login-ready" })}\n`); },
+    });
   } finally {
     continuation.close();
   }
@@ -280,6 +290,8 @@ async function setupCommand(args: string[]): Promise<void> {
   if (automaticBrowserInteraction || manualBrowserInteraction) {
     options.browserInteractionMode = manualBrowserInteraction ? "manual" : "automatic";
   }
+  const connectorNameSuffix = takeOption(args, "--connector-name-suffix");
+  if (connectorNameSuffix !== undefined) options.connectorNameSuffix = connectorNameSuffix;
   const subagentProtocol = takeOption(args, "--subagent-protocol");
   if (subagentProtocol !== undefined) {
     if (subagentProtocol !== "compatibility-v1" && subagentProtocol !== "native") {
@@ -287,7 +299,6 @@ async function setupCommand(args: string[]): Promise<void> {
     }
     options.subagentProtocol = subagentProtocol;
   }
-  const appName = takeOption(args, "--app-name");
   const tunnelId = takeOption(args, "--tunnel-id");
   const runtimeKeyFile = takeOption(args, "--runtime-key-file");
   const chrome = takeOption(args, "--chrome");
@@ -295,17 +306,34 @@ async function setupCommand(args: string[]): Promise<void> {
   if (chrome) options.chromeExecutablePath = chrome;
   if (browserHostDescriptorPath) options.browserHostDescriptorPath = browserHostDescriptorPath;
   options.refreshAccountCapabilities = takeFlag(args, "--refresh-account-capabilities");
-  if (appName) options.appName = appName;
   if (tunnelId) options.tunnelId = tunnelId;
   if (runtimeKeyFile) options.runtimeKeyFile = runtimeKeyFile;
   options.forceLogin = takeFlag(args, "--login");
   options.autoApproveToolCalls = takeFlag(args, "--auto-approve-tool-calls");
+  const predictions = takeFlag(args, "--composer-predictions");
+  const noPredictions = takeFlag(args, "--no-composer-predictions");
+  if (predictions && noPredictions) throw new Error("Choose --composer-predictions or --no-composer-predictions");
+  if (predictions || noPredictions) options.composerPredictionsEnabled = predictions;
+  const skillAttachments = takeFlag(args, "--skill-attachments");
+  const inlineSkills = takeFlag(args, "--inline-skills");
+  if (skillAttachments && inlineSkills) throw new Error("Choose --skill-attachments or --inline-skills");
+  const savedChats = takeFlag(args, "--saved-chats");
+  const temporaryChats = takeFlag(args, "--temporary-chats");
+  if (savedChats && temporaryChats) throw new Error("Choose --saved-chats or --temporary-chats");
+  if (savedChats || temporaryChats) options.useSavedChats = savedChats;
+  const freshConversation = takeFlag(args, "--fresh-conversation");
+  const retainedConversation = takeFlag(args, "--retained-conversation");
+  if (freshConversation && retainedConversation) {
+    throw new Error("Choose --fresh-conversation or --retained-conversation");
+  }
+  if (freshConversation || retainedConversation) options.experimentalFreshConversationPerTurn = freshConversation;
   const biggerContext = takeFlag(args, "--bigger-context");
   const standardContext = takeFlag(args, "--standard-context");
   if (biggerContext && standardContext) {
     throw new Error("Choose at most one context mode: --bigger-context or --standard-context");
   }
   if (biggerContext || standardContext) options.experimentalBiggerContext = biggerContext;
+  if (skillAttachments || inlineSkills) options.experimentalSkillAttachments = skillAttachments;
   const zeroRiskPro = takeFlag(args, "--zero-risk-pro");
   const zeroRiskDefault = takeFlag(args, "--zero-risk-default");
   if (zeroRiskPro && zeroRiskDefault) {
@@ -313,6 +341,7 @@ async function setupCommand(args: string[]): Promise<void> {
   }
   if (zeroRiskPro || zeroRiskDefault) options.zeroRiskProEnabled = zeroRiskPro;
   options.replaceCodexRoute = takeFlag(args, "--replace-codex-route");
+  options.preserveDisconnectedRoute = takeFlag(args, "--preserve-disconnected-route");
   options.restartService = takeFlag(args, "--restart-service");
   assertNoArgs(args);
 
@@ -370,6 +399,7 @@ async function doctorCommand(args: string[]): Promise<void> {
 
 async function routeCommand(args: string[]): Promise<void> {
   const action = args.shift() ?? "status";
+  const forRuntimeRecovery = action === "disconnect" && takeFlag(args, "--for-runtime-recovery");
   assertNoArgs(args);
   const result = action === "status"
     ? (() => {
@@ -377,17 +407,22 @@ async function routeCommand(args: string[]): Promise<void> {
         return {
           installed: status.installed,
           active: status.active,
+          ...(status.journal && "reconnectOnStartup" in status.journal && status.journal.reconnectOnStartup
+            ? { reconnectOnStartup: true } : {}),
           ...(status.routeUrl ? { routeUrl: status.routeUrl } : {}),
           errors: status.errors,
         };
       })()
-    : action === "connect"
-      ? activateCodexIntegration()
+    : action === "connect" || action === "recover"
+      ? activateCodexIntegration({ recoveryOnly: action === "recover" })
       : action === "disconnect"
-        ? deactivateCodexIntegration()
+        ? deactivateCodexIntegration({ forRuntimeRecovery })
         : undefined;
   if (!result) throw new Error(`Unknown route action: ${action}`);
   stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+  if ("changed" in result && result.changed) {
+    process.stderr.write("Fully restart Codex to apply the route change.\n");
+  }
 }
 
 async function subagentsCommand(args: string[]): Promise<void> {
