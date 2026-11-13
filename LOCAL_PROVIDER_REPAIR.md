@@ -98,3 +98,12 @@ protected configuration snapshots. Quit only Codex Web GPT before restoring a
 bundle. The original upstream bundle rejects the custom provider again; the
 intermediate pre-calendar build starts but retains the native-turn defect.
 Do not restore global configuration blindly or remove provider aliases.
+
+
+## Passkey storage follow-up
+
+The installed ASAR is now `4ee686a3151e34c98c02e45872b16c0a80689ec36beaf3a597b7632c9218e628`
+with the separately tested passkey-size correction. Runtime source/identity is
+unchanged. Full launcher validation is now 491 passed, 1 skipped. See
+[PASSKEY_STORAGE_REPAIR.md](PASSKEY_STORAGE_REPAIR.md) for reproduction, live
+activation, backup, remaining user login step and upstream issue991.

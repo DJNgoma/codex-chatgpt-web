@@ -57,3 +57,36 @@ test("passkey transfer rejects malformed allowed-domain cookie fields", () => {
     origins: [],
   }), /invalid cookie SameSite/);
 });
+
+function storageState(localStorage) {
+  return { cookies: [cookie("session", ".chatgpt.com")],
+    origins: [{ origin: "https://chatgpt.com", localStorage }] };
+}
+
+test("passkey transfer preserves a browser-valid value above the old generic string limit", () => {
+  const value = "x".repeat(3 * 1024 * 1024);
+  const result = validatePasskeyLoginState(storageState([{ name: "large-state", value }]));
+  assert.equal(result.localStorage[0].value, value);
+});
+
+test("passkey transfer accounts for names at the UTF16 storage boundary", () => {
+  const value = "x".repeat(5 * 1024 * 1024 - 1);
+  assert.equal(validatePasskeyLoginState(storageState([{ name: "k", value }])).localStorage[0].value.length, value.length);
+  assert.throws(() => validatePasskeyLoginState(storageState([{ name: "kk", value }])), /local-storage.*too large/);
+});
+
+test("passkey transfer bounds aggregate local storage across entries and origins", () => {
+  const entry = { name: "state", value: "x".repeat(2 * 1024 * 1024) };
+  assert.throws(() => validatePasskeyLoginState(storageState([entry, entry, entry])), /local-storage.*too large/);
+  const state = storageState([entry]);
+  state.origins.push(state.origins[0], state.origins[0]);
+  assert.throws(() => validatePasskeyLoginState(state), /local-storage.*too large/);
+});
+
+test("passkey transfer retains general cookie bounds and rejects invalid storage values", () => {
+  const state = storageState([]);
+  state.cookies[0].value = "x".repeat(2 * 1024 * 1024 + 1);
+  assert.throws(() => validatePasskeyLoginState(state), /cookie value is too large/);
+  assert.throws(() => validatePasskeyLoginState(storageState([{ name: "key", value: 42 }])), /invalid local-storage value/);
+  assert.throws(() => validatePasskeyLoginState(storageState([{ name: "key", value: "x".repeat(5 * 1024 * 1024 + 1) }])), /local-storage.*too large/);
+});
