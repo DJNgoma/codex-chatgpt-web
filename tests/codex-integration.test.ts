@@ -30,6 +30,8 @@ import {
   writeFilesWithCompensation,
 } from "../src/codex-integration-shared";
 
+import { isLocalCatalogProxy } from "../src/codex-integration-route";
+
 const roots: string[] = [];
 
 function nativeConfig(mode: "browser-only" | "full") {
@@ -818,7 +820,9 @@ describe("reversible native Codex route integration", () => {
     ].join("\n");
     writeFileSync(configPath, original);
 
-    installCodexIntegration(nativeConfig("full"));
+    // A catalog-driven bridge already owns the picker, so installing over it is opt-in; what this
+    // covers is that opting in still leaves both of its keys untouched.
+    installCodexIntegration(nativeConfig("full"), { replaceExistingRoute: true });
     const userEdited = readFileSync(configPath, "utf8")
       .replace('model_provider = "openai"', 'model_provider = "second-provider"')
       .replace('model_catalog_json = "/tmp/first.json"', 'model_catalog_json = "/tmp/second.json"')
@@ -883,6 +887,24 @@ describe("reversible native Codex route integration", () => {
     expect(readFileSync(getCodexJournalRecoveryPath(), "utf8")).toBe(journal);
     expect(uninstallCodexIntegration()).toEqual({ changed: true });
     expect(readFileSync(configPath, "utf8")).toBe(changed);
+  });
+
+  test("refuses by default when another local bridge's catalog owns the model picker", () => {
+    const { codexHome } = fixture();
+    const configPath = join(codexHome, "config.toml");
+    const original = [
+      'model = "claude-opus"',
+      'model_provider = "openai"',
+      'model_catalog_json = "/Users/example/.codex/local-bridge/model-catalog.json"',
+      "",
+    ].join("\n");
+    writeFileSync(configPath, original);
+
+    // Codex reads the picker from that catalog, so this route would install but list nothing.
+    expect(() => preflightCodexIntegration(nativeConfig("full"))).toThrow(/another local bridge/);
+    expect(() => installCodexIntegration(nativeConfig("full"))).toThrow(/model_catalog_json/);
+    expect(readFileSync(configPath, "utf8")).toBe(original);
+    expect(inspectCodexIntegration().installed).toBe(false);
   });
 
   test("preflight detects route conflicts without changing Codex or creating a journal", () => {
@@ -1194,4 +1216,29 @@ test("startup recovery and upgrades respect explicit route disconnects", () => {
   deactivateCodexIntegration({ forRuntimeRecovery: true });
   expect(activateCodexIntegration({ recoveryOnly: true }).active).toBeFalse();
   expect(activateCodexIntegration().active).toBeTrue();
+});
+
+
+test("an existing managed route serves the verified local catalogue proxy without replacing its provider", () => {
+  const { codexHome } = fixture();
+  installCodexIntegration(nativeConfig("browser-only"));
+  const configPath = join(codexHome, "config.toml");
+  const catalogPath = join(codexHome, "external-catalog.json");
+  const owned = readFileSync(configPath, "utf8");
+  writeFileSync(catalogPath, JSON.stringify({ models: [{ slug: "chatgpt-web-5.6-sol", visibility: "list" }] }));
+  const proxy = `model_provider = "local_model_bridge"\nmodel_catalog_json = ${JSON.stringify(catalogPath)}\n` + owned
+    + '\n[model_providers.local_model_bridge]\nbase_url = "http://127.0.0.1:48111/v1"\n';
+  writeFileSync(configPath, proxy);
+  expect(isLocalCatalogProxy(proxy)).toBe(true);
+  expect(inspectCodexIntegration().errors).toEqual([]);
+  preflightCodexIntegration(nativeConfig("browser-only"));
+  expect(readFileSync(configPath, "utf8")).toBe(proxy);
+  for (const invalid of [proxy.replace("48111", "48112"), proxy.replace("local_model_bridge", "unrelated_provider")]) {
+    expect(isLocalCatalogProxy(invalid)).toBe(false);
+  }
+  for (const catalog of ["invalid-json", JSON.stringify({ models: [{ slug: "chatgpt-web-5.6-sol", visibility: "hide" }] }), JSON.stringify({ models: [] })]) {
+    writeFileSync(catalogPath, catalog);
+    expect(isLocalCatalogProxy(proxy)).toBe(false);
+    expect(inspectCodexIntegration().errors.length).toBeGreaterThan(0);
+  }
 });

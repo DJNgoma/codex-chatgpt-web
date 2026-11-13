@@ -20,6 +20,7 @@ import type {
   ChatGptThreadSpawnLineage,
   ChatGptTurnEnvironment,
   ChatGptUnattributedEnvironmentMessage,
+  ChatGptCalendarPreamble,
 } from "./environment";
 
 type RolloutIdentity = ChatGptRootThreadMetadata | ChatGptThreadSpawnLineage;
@@ -281,6 +282,55 @@ function verifyCompactedEnvironmentItems(fd: number, size: number, items: Record
     }
     previousIndex = matches[0]!.index;
   }
+}
+
+/** Accept only a native initial preamble between this task boundary and its turn context.
+ * The date fragment grants no filesystem permissions; those still come from turn_context.
+ */
+function verifyCurrentCalendarPreamble(fd: number, size: number, turnId: string, message: ChatGptCalendarPreamble): void {
+  let currentTask = false;
+  let matched = false;
+  let calendarMatched = false;
+  let position = 0;
+  let carry = Buffer.alloc(0);
+  while (position < size) {
+    const length = Math.min(ROLLOUT_READ_CHUNK_BYTES, size - position);
+    const chunk = Buffer.alloc(length);
+    if (readSync(fd, chunk, 0, length, position) !== length) throw new Error("Codex rollout changed during calendar preamble lookup");
+    position += length;
+    const data = Buffer.concat([carry, chunk]);
+    let start = 0;
+    for (let end = data.indexOf(0x0a); end >= 0; end = data.indexOf(0x0a, start)) {
+      const line = data.subarray(start, end);
+      start = end + 1;
+      if (!line.length) continue;
+      if (line.length > MAX_ROLLOUT_JSON_LINE_BYTES) throw new Error("Codex rollout JSONL record exceeds the bounded record size");
+      const item = parseJsonLine(line);
+      const payload = record(item.payload);
+      if (item.type === "event_msg" && payload?.type === "task_started") {
+        currentTask = payload.turn_id === turnId;
+        matched = false;
+        calendarMatched = false;
+      }
+      if (!currentTask) continue;
+      if (item.type === "response_item" && payload?.id === message.id) {
+        if (matched || payload.type !== "message" || payload.role !== "user"
+          || !isDeepStrictEqual(payload.content, message.content)) throw new Error("Calendar preamble differs from its native Codex record");
+        matched = true;
+      }
+      if (item.type === "world_state" && matched && payload?.full === true) {
+        const calendar = record(record(payload.state)?.environments);
+        calendarMatched = calendar?.current_date === message.currentDate && calendar?.timezone === message.timezone;
+      }
+      if (item.type === "turn_context") {
+        if (payload?.turn_id === turnId && matched && calendarMatched) return;
+        throw new Error("Codex rollout does not authenticate the current calendar preamble");
+      }
+    }
+    carry = Buffer.from(data.subarray(start));
+    if (carry.length > MAX_ROLLOUT_JSON_LINE_BYTES) throw new Error("Codex rollout JSONL record exceeds the bounded record size");
+  }
+  throw new Error("Codex rollout does not authenticate the current calendar preamble");
 }
 
 function verifyHistoricalEnvironmentMessages(
@@ -714,6 +764,7 @@ export function resolveCurrentCodexRolloutEnvironment(options: {
   compactionSourceTurnId?: string;
   tools?: readonly CodexTool[];
   historicalEnvironmentMessages?: ChatGptUnattributedEnvironmentMessage[];
+  currentCalendarPreamble?: ChatGptCalendarPreamble;
   compactedEnvironmentItems?: Record<string, unknown>[];
 }): CodexRolloutEnvironment | undefined {
   const { codexHome, lineage, turnId, tools, compactionSourceTurnId } = options;
@@ -764,6 +815,17 @@ export function resolveCurrentCodexRolloutEnvironment(options: {
       const environment = environmentFromTurnContext(latest, latest.turn_id as string, tools, runtimeWorkspaceRoots);
       const workspaceRootsDeclared = latest.workspace_roots !== undefined || runtimeWorkspaceRoots !== undefined;
       validateMetadataConsistency(lineage, environment, workspaceRootsDeclared);
+      if (options.currentCalendarPreamble) {
+        try {
+          verifyCurrentCalendarPreamble(fd, size, turnId, options.currentCalendarPreamble);
+        } catch (error) {
+          if (options.currentCalendarPreamble.currentTurnAttributed) throw error;
+          // Older calendar-only preambles remain contextual history if the unchanged
+          // historical verifier proves the exact native item before this task.
+          try { verifyHistoricalEnvironmentMessages(fd, size, turnId, [options.currentCalendarPreamble]); }
+          catch { throw error; }
+        }
+      }
       if (options.historicalEnvironmentMessages) {
         verifyHistoricalEnvironmentMessages(fd, size, turnId, options.historicalEnvironmentMessages);
       }

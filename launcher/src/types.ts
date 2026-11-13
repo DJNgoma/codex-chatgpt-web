@@ -30,6 +30,7 @@ export interface LauncherState {
   browserSmokeVersion?: string | null;
   coreSetupComplete?: boolean;
   codexCatalogVerified?: boolean;
+  codexCatalogVerificationSource?: "codex-request" | "external-model-catalog";
   mcpSetupComplete?: boolean;
   mcpRuntimeInstalled?: boolean;
   codexRestartRequired?: boolean;
@@ -96,6 +97,27 @@ export interface DoctorReport {
   ok: boolean;
   mode?: "browser-only" | "full";
   checks: DoctorCheck[];
+}
+
+export interface InstalledModel {
+  slug: string;
+  displayName: string;
+  visible: boolean;
+}
+
+// Configured catalogue entries and independently observed runtime evidence.
+export interface ModelCheckReport {
+  installed: boolean;
+  runtimeVerified: boolean;
+  routeInstalled: boolean;
+  source: "bridge" | "external" | "unknown";
+  catalogPath: string | null;
+  catalogReadable: boolean;
+  models: InstalledModel[];
+  servedCatalogRequests: number;
+  lastServedAt: string | null;
+  detail: string | null;
+  state?: LauncherState;
 }
 
 export interface OperationState {
@@ -168,6 +190,7 @@ export interface LauncherApi {
   cancelTurns(): Promise<{ stdout: string }>;
   uninstallIntegration(): Promise<{ cancelled: true } | { cancelled: false; state: LauncherState }>;
   setupCore(): Promise<{ ok: boolean; stdout: string; restartRequired: boolean }>;
+  checkModels(): Promise<ModelCheckReport>;
   setupMcp(input: {
     tunnelId?: string;
     runtimeKey?: string;

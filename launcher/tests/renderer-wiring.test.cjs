@@ -158,7 +158,7 @@ test("setup preserves session-check failures and never installs without verified
     const state = { browserInteractionMode: "automatic", coreSetupComplete: false };
     const run = async () => { installs++; return { mode: "browser-only", stdout: "" }; };
     vm.runInNewContext(source, {
-      handle: (_name, handler) => { setup = handler; }, IS_DEV_PROFILE: dev,
+      handle: (name, handler) => { if (name === "launcher:setup-core") setup = handler; }, IS_DEV_PROFILE: dev,
       stateStore: { read: () => state, update() {} },
       browserHost: { probeAuthentication: async () => browser, returnToIdle: async () => {} },
       runtimeHost: { setupCore: run, setupDevCore: run, runtimeConfigSnapshot: () => ({ config: {} }) },
@@ -438,6 +438,17 @@ test("installed integration can connect MCP while the native catalog refresh is 
   assert.equal(connected, 5);
 });
 
+test("the catalogue monitor uses the behaviourally tested evidence policy", () => {
+  const monitor = electronMain.slice(
+    electronMain.indexOf("function startCatalogVerificationMonitor"),
+    electronMain.indexOf("async function restoreCodexRouteAfterRuntimeFailure"),
+  );
+  assert.match(monitor, /catalogVerificationPatch\(stateStore\.read\(\), picker, health\)/);
+  assert.match(monitor, /stateStore\.update\(patch\)/);
+  assert.doesNotMatch(monitor, /codexRestartRequired: false/);
+  assert.match(monitor, /verifiedBy: patch\.codexCatalogVerificationSource/);
+});
+
 test("MCP navigation remains locked while an operation is active", () => {
   assert.match(appSource, /<McpSurface[\s\S]*?operation=\{operation\}/);
   assert.match(appSource, /const busy = localBusy \|\| operation\?\.status === "running"/);
@@ -521,6 +532,9 @@ test("catalog verification reports a failed request instead of requesting anothe
   vm.runInNewContext(source + "\nconst publishOperation = op => { lastOperation = op; recordOperation(op); };\nstartCatalogVerificationMonitor({ logger, stateStore });", {
     catalogVerificationInFlight: false, catalogVerificationTimer: null, lastOperation: null,
     stopCatalogVerificationMonitor() {},
+    inspectCodexModelPicker: () => ({ source: "bridge", readable: true, models: [] }),
+    codexHomePath: () => "/fixture/codex",
+    catalogVerificationPatch: require("../electron/catalog-verification.cjs").catalogVerificationPatch,
     runtimeSupervisor: { readConfig: () => ({}), proxyHealthPayload: async () => payload },
     stateStore: { read: () => state, update: patch => Object.assign(state, patch) },
     setInterval: callback => { tick = callback; return { unref() {} }; },
@@ -537,7 +551,7 @@ test("catalog verification reports a failed request instead of requesting anothe
   await tick();
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(state.codexCatalogVerified, false);
-  assert.equal(state.codexRestartRequired, false);
+  assert.equal(state.codexRestartRequired, true);
   assert.equal(operations[0]?.status, "failed");
   assert.match(operations[0].message, /502.*UnsupportedProxyProtocol/);
   await tick();
@@ -920,4 +934,27 @@ test("catalog recovery clears its error banner but preserves a newer unrelated f
   callback({ name: "setup", status: "failed", message: "Setup error" });
   callback({ name: "catalog-verification", status: "completed", message: "Loaded" });
   assert.equal(error, "Setup error");
+});
+
+test("installed models can be checked without redoing the install", () => {
+  // Install models rewrites Codex's config and resets codexCatalogVerified, so asking whether the
+  // models are already there must not go through it.
+  assert.match(preloadSource, /checkModels:[\s\S]*?launcher:check-models/);
+  assert.match(appSource, /const report = await api!\.checkModels\(\);/);
+  assert.match(appSource, /onSecondaryAction=\{devProfile \? undefined : checkModels\}/);
+
+  const handler = electronMain.slice(
+    electronMain.indexOf('handle("launcher:check-models"'),
+    electronMain.indexOf('handle("launcher:setup-mcp"'),
+  );
+  assert.ok(handler.length > 0);
+  // Asking this bridge for /v1/models would increment the very counter that proves Codex
+  // restarted onto the route, so the check must never request it.
+  assert.doesNotMatch(handler, /v1\/models/);
+  assert.match(handler, /inspectCodexModelPicker\(codexHomePath\(\)\)/);
+  assert.match(handler, /catalogVerificationPatch\(state, picker, health\)/);
+  assert.match(handler, /stateStore\.update\(patch\)/);
+  assert.doesNotMatch(handler, /codexRestartRequired: false/);
+  assert.match(appSource, /copy\.modelsRuntimeUnverified/);
+  assert.match(appSource, /!report\.catalogReadable \|\| report\.source === "unknown"/);
 });

@@ -321,6 +321,7 @@ function defaultDependencies() {
 
 function createUpdateController({
   currentVersion,
+  localBuildPolicy,
   platform,
   arch,
   packaged,
@@ -419,6 +420,15 @@ function createUpdateController({
   async function beginInstall() {
     if (pending) throw new Error("An update is already being prepared");
     if (state.status !== "available" || !candidate) throw new Error("No launcher update is available");
+    // This artifact carries a provider compatibility repair that official release assets
+    // do not promise to preserve. Keep update discovery, but require a reviewed build
+    // instead of letting the upstream worker replace the full application bundle.
+    if (localBuildPolicy?.localProviderCoexistence === true
+      || localBuildPolicy?.updateInstallPolicy === "reviewed-compatible-build-only") {
+      throw new Error("This build includes the local provider coexistence repair. "
+        + "Upstream updates require a reviewed compatible build before installation. "
+        + "Ask Codex to evaluate the release, port and test the repair, then install that build.");
+    }
     if (platform === "linux") linuxUpdateInstallation();
     const available = candidate;
     pending = (async () => {

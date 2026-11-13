@@ -2,6 +2,10 @@
   "name": "codex-web-gpt-launcher",
   "version": "6.1.18",
   "private": true,
+  "localBuildPolicy": {
+    "localProviderCoexistence": true,
+    "updateInstallPolicy": "reviewed-compatible-build-only"
+  },
   "description": "Desktop control center for Codex ChatGPT Web",
   "author": "miuuyy",
   "type": "module",
@@ -24,7 +28,8 @@
   "dependencies": {
     "motion": "^12.42.2",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "smol-toml": "^1.9.1"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
