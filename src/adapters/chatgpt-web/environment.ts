@@ -160,6 +160,7 @@ export interface ChatGptUnattributedEnvironmentMessage {
 /** These are claims to locate in native history, never a source of filesystem authority. */
 export function unattributedChatGptEnvironmentMessages(
   parsed: CodexParsedRequest,
+  excludeCalendarPreambleId?: string,
 ): ChatGptUnattributedEnvironmentMessage[] | undefined {
   const body = record(parsed._rawBody);
   const input = Array.isArray(body?.input) ? body.input : [];
@@ -167,7 +168,8 @@ export function unattributedChatGptEnvironmentMessages(
   const messages: ChatGptUnattributedEnvironmentMessage[] = [];
   for (const value of input) {
     const item = record(value);
-    if (!hasEnvironmentContextFragment(item)) continue;
+    if (!hasEnvironmentContextFragment(item)
+      || (excludeCalendarPreambleId !== undefined && item?.id === excludeCalendarPreambleId)) continue;
     // Explicit current provenance must keep the normal current-update rejection. A native item
     // without provenance is historical only if the canonical rollout proves that exact message.
     const owner = itemTurnId(item);
@@ -177,6 +179,50 @@ export function unattributedChatGptEnvironmentMessages(
     messages.push({ id: item.id, content: item.content });
   }
   return messages.length > 0 ? messages : undefined;
+}
+
+export interface ChatGptCalendarPreamble extends ChatGptUnattributedEnvironmentMessage {
+  currentDate: string;
+  timezone?: string;
+  currentTurnAttributed?: boolean;
+}
+
+/** Calendar text is contextual only; the canonical current preamble must prove its origin. */
+export function currentChatGptCalendarPreamble(parsed: CodexParsedRequest): ChatGptCalendarPreamble | undefined {
+  const metadata = clientTurnMetadata(parsed);
+  const turnId = extractChatGptTurnIdentity(parsed).turnId;
+  if (!metadata || !turnId) return undefined;
+  const body = record(parsed._rawBody);
+  const input = Array.isArray(body?.input) ? body.input : [];
+  const activeIndex = input.findLastIndex(value => isNativeInstruction(record(value), metadata));
+  const candidates: ChatGptCalendarPreamble[] = [];
+  for (let index = 0; index < activeIndex; index++) {
+    const item = record(input[index]);
+    if (!hasEnvironmentContextFragment(item)) continue;
+    if (item?.type !== "message" || item.role !== "user" || typeof item.id !== "string" || !item.id
+      || (itemTurnId(item) !== undefined && itemTurnId(item) !== turnId)) continue;
+    const parts = Array.isArray(item.content) ? item.content.map(part => record(part)?.text) : [item.content];
+    const fragments = parts.filter((text): text is string => typeof text === "string" && text.includes("<environment_context>"));
+    if (fragments.length !== 1) continue;
+    const match = /^<environment_context>\s*<current_date>(\d{4}-\d{2}-\d{2})<\/current_date>\s*(?:<timezone>([^<>]+)<\/timezone>\s*)?<\/environment_context>$/.exec(fragments[0]!.trim());
+    if (!match) continue;
+    candidates.push({ id: item.id, content: item.content, currentDate: match[1]!, ...(match[2] ? { timezone: match[2] } : {}),
+      ...(itemTurnId(item) === turnId ? { currentTurnAttributed: true } : {}) });
+  }
+  const candidate = candidates.at(-1);
+  // Filtering a selected item out of historical verification must never hide
+  // another (possibly different) message that reuses its native item id.
+  if (!candidate || input.filter(value => record(value)?.id === candidate.id).length !== 1) return undefined;
+  // The new calendar path cannot conceal another attempted current update. Every
+  // remaining untagged envelope still goes through exact historical verification.
+  for (const value of input) {
+    const item = record(value);
+    if (!hasEnvironmentContextFragment(item) || item?.id === candidate.id) continue;
+    const owner = itemTurnId(item);
+    if (owner === turnId || (owner === undefined && (item?.type !== "message" || item.role !== "user"
+      || typeof item.id !== "string" || !item.id))) return undefined;
+  }
+  return candidate;
 }
 
 function contextualUserMessage(value: Record<string, unknown>): boolean {

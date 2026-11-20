@@ -321,6 +321,7 @@ function defaultDependencies() {
 
 function createUpdateController({
   currentVersion,
+  localBuildPolicy,
   platform,
   arch,
   packaged,
@@ -333,6 +334,8 @@ function createUpdateController({
   dependencies = {},
 }) {
   const deps = { ...defaultDependencies(), ...dependencies };
+  const requiresReview = localBuildPolicy?.localProviderCoexistence === true
+    || localBuildPolicy?.updateInstallPolicy === "reviewed-compatible-build-only";
   const supportedAsset = releaseAssetName(currentVersion, platform, arch);
   let state = packaged && supportedAsset ? { status: "idle" } : { status: "disabled" };
   let checked = false;
@@ -393,7 +396,7 @@ function createUpdateController({
         checksumsUrl: validateReleaseAssetUrl(checksums.browser_download_url, version, "checksums.txt"),
       };
       logger?.info("launcher.update_available", { currentVersion, version, platform, arch });
-      return transition({ status: "available", version });
+      return transition({ status: requiresReview ? "review-required" : "available", version });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const retryAt = Number.isSafeInteger(error?.retryAt) && error.retryAt > Date.now()
@@ -418,6 +421,9 @@ function createUpdateController({
 
   async function beginInstall() {
     if (pending) throw new Error("An update is already being prepared");
+    if (requiresReview) {
+      throw new Error("The local provider coexistence repair requires a reviewed compatible build.");
+    }
     if (state.status !== "available" || !candidate) throw new Error("No launcher update is available");
     if (platform === "linux") linuxUpdateInstallation();
     const available = candidate;

@@ -28,6 +28,10 @@ const { SOURCE_URL: LIMITS_SOURCE_URL } = require("./limits-store.cjs");
 const { releaseRetainedConversation } = require("./retained-turn-release.cjs");
 const { getAutostart, setAutostart } = require("./autostart.cjs");
 const {
+  inspectCodexModelPicker,
+} = require("./codex-catalog-route.cjs");
+const { catalogVerificationPatch, legacyCatalogVerificationPatch } = require("./catalog-verification.cjs");
+const {
   createLogger,
   exportSanitizedLogs,
   installProcessDiagnosticGuards,
@@ -139,6 +143,12 @@ function publishOperation(operation) {
   send("launcher:operation", operation);
 }
 
+// The launcher always pins CODEX_HOME to its own profile; the default is the fallback for a
+// process that somehow lost it.
+function codexHomePath() {
+  return process.env.CODEX_HOME?.trim() || path.join(app.getPath("home"), ".codex");
+}
+
 function stopCatalogVerificationMonitor() {
   if (catalogVerificationTimer) clearInterval(catalogVerificationTimer);
   catalogVerificationTimer = null;
@@ -156,10 +166,16 @@ function startCatalogVerificationMonitor({ logger, stateStore }) {
     if (catalogVerificationInFlight || !runtimeSupervisor) return;
     catalogVerificationInFlight = true;
     try {
-      const config = runtimeSupervisor.readConfig();
-      const health = await runtimeSupervisor.proxyHealthPayload(config);
-      if (!Number.isInteger(health?.successful_model_catalog_requests)
-        || health.successful_model_catalog_requests < 1) {
+      const picker = inspectCodexModelPicker(codexHomePath());
+      let health = null;
+      try {
+        health = await runtimeSupervisor.proxyHealthPayload(runtimeSupervisor.readConfig());
+      } catch (error) {
+        logger.debug("codex.model_catalog_runtime_unavailable", { message: error.message });
+      }
+      const patch = catalogVerificationPatch(stateStore.read(), picker, health);
+      if (!patch) {
+        if (picker.source !== "bridge") return;
         const result = health?.last_model_catalog_result;
         if (!result || !Number.isInteger(result.status) || result.status < 400 || result.status > 599
           || !Number.isInteger(result.request) || result.request < 1 || lastOperation?.status === "running") return;
@@ -169,8 +185,6 @@ function startCatalogVerificationMonitor({ logger, stateStore }) {
         const reason = typeof result.failure?.code === "string" && /^[A-Za-z0-9_.-]{1,64}$/.test(result.failure.code)
           ? result.failure.code
           : ["config", "request", "transport", "upstream", "catalog"].includes(result.failure?.stage) ? result.failure.stage : "catalog";
-        const state = stateStore.update({ codexRestartRequired: false });
-        send("launcher:state-changed", state);
         logger.warn("codex.model_catalog_failed", { status: result.status, reason, request: result.request });
         publishOperation({
           name: "catalog-verification", status: "failed",
@@ -179,13 +193,12 @@ function startCatalogVerificationMonitor({ logger, stateStore }) {
         });
         return;
       }
-      const state = stateStore.update({
-        codexCatalogVerified: true,
-        codexRestartRequired: false,
-      });
+      const state = stateStore.update(patch);
       logger.info("codex.model_catalog_verified", {
-        requests: health.successful_model_catalog_requests,
-        at: health.last_successful_model_catalog_request_at,
+        verifiedBy: patch.codexCatalogVerificationSource,
+        runtimeVerified: patch.codexCatalogVerificationSource === "codex-request",
+        requests: health?.successful_model_catalog_requests ?? 0,
+        at: health?.last_successful_model_catalog_request_at ?? null,
       });
       send("launcher:state-changed", state);
       if (lastOperation?.name === "catalog-verification" && lastOperation.status === "failed") {
@@ -879,6 +892,57 @@ function registerIpc({ logger, stateStore }) {
     if (!IS_DEV_PROFILE) startCatalogVerificationMonitor({ logger, stateStore });
     return { ok: true, stdout: result.stdout, restartRequired: !IS_DEV_PROFILE };
   });
+  // Check installed entries without reinstalling or fabricating a catalogue request.
+  // File evidence may unlock the catalogue gate, but only runtime evidence clears a restart.
+  handle("launcher:check-models", async () => {
+    if (IS_DEV_PROFILE) throw new Error("The DEV profile installs no Codex model route to check");
+    const picker = inspectCodexModelPicker(codexHomePath());
+    let served = 0;
+    let servedAt = null;
+    let runtimeDetail = null;
+    let health = null;
+    try {
+      health = await runtimeSupervisor.proxyHealthPayload(runtimeSupervisor.readConfig());
+      if (Number.isSafeInteger(health?.successful_model_catalog_requests)
+        && health.successful_model_catalog_requests >= 0) {
+        served = health.successful_model_catalog_requests;
+      }
+      servedAt = health?.last_successful_model_catalog_request_at ?? null;
+    } catch (error) {
+      // The bridge being down says nothing about the picker; report it beside the answer.
+      runtimeDetail = error instanceof Error ? error.message : String(error);
+    }
+    const state = stateStore.read();
+    const patch = catalogVerificationPatch(state, picker, health);
+    const installed = patch !== null;
+    const runtimeVerified = patch?.codexCatalogVerificationSource === "codex-request";
+    const report = {
+      installed,
+      runtimeVerified,
+      routeInstalled: state.coreSetupComplete === true,
+      source: picker.source,
+      catalogPath: picker.catalogPath,
+      catalogReadable: picker.readable,
+      models: picker.models,
+      servedCatalogRequests: served,
+      lastServedAt: servedAt,
+      detail: picker.error || runtimeDetail,
+    };
+    logger.info("codex.model_check", {
+      installed,
+      runtimeVerified,
+      source: picker.source,
+      models: picker.models.length,
+      requests: served,
+    });
+    if (patch && Object.entries(patch).some(([key, value]) => state[key] !== value)) {
+      const updated = stateStore.update(patch);
+      stopCatalogVerificationMonitor();
+      send("launcher:state-changed", updated);
+      return { ...report, state: updated };
+    }
+    return report;
+  });
   handle("launcher:setup-mcp", async (_event, input) => {
     const currentMode = stateStore.read().browserInteractionMode;
     const interactionMode = input?.interactionMode === undefined
@@ -1182,6 +1246,8 @@ async function start() {
     stateStore.update({ sessionRefreshReminderAt: nextSessionRefreshReminderAt() });
   }
   const persistedState = stateStore.read();
+  const legacyVerification = !IS_DEV_PROFILE && legacyCatalogVerificationPatch(persistedState);
+  if (legacyVerification) stateStore.update(legacyVerification);
   if (persistedState.coreSetupComplete === true && persistedState.codexCatalogVerified === undefined) {
     stateStore.update({
       coreSetupComplete: false,
@@ -1277,6 +1343,7 @@ async function start() {
   const updaterRuntimeRoot = runtimeRootProvider();
   updateController = createUpdateController({
     currentVersion: app.getVersion(),
+    localBuildPolicy: require("../package.json").localBuildPolicy,
     platform: process.platform,
     arch: process.arch,
     packaged: app.isPackaged && !IS_DEV_PROFILE,

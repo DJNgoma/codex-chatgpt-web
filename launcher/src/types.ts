@@ -30,6 +30,7 @@ export interface LauncherState {
   browserSmokeVersion?: string | null;
   coreSetupComplete?: boolean;
   codexCatalogVerified?: boolean;
+  codexCatalogVerificationSource?: "codex-request" | "external-model-catalog";
   mcpSetupComplete?: boolean;
   mcpRuntimeInstalled?: boolean;
   codexRestartRequired?: boolean;
@@ -98,6 +99,27 @@ export interface DoctorReport {
   checks: DoctorCheck[];
 }
 
+export interface InstalledModel {
+  slug: string;
+  displayName: string;
+  visible: boolean;
+}
+
+// Configured catalogue entries and independently observed runtime evidence.
+export interface ModelCheckReport {
+  installed: boolean;
+  runtimeVerified: boolean;
+  routeInstalled: boolean;
+  source: "bridge" | "external" | "unknown";
+  catalogPath: string | null;
+  catalogReadable: boolean;
+  models: InstalledModel[];
+  servedCatalogRequests: number;
+  lastServedAt: string | null;
+  detail: string | null;
+  state?: LauncherState;
+}
+
 export interface OperationState {
   name: string;
   status: "running" | "completed" | "failed";
@@ -106,7 +128,7 @@ export interface OperationState {
 
 export type UpdateState =
   | { status: "disabled" | "idle" | "checking" | "up-to-date" }
-  | { status: "available" | "downloading" | "installing"; version: string }
+  | { status: "available" | "review-required" | "downloading" | "installing"; version: string }
   | { status: "error"; message: string; retryAt?: number };
 
 export interface LauncherSnapshot {
@@ -169,6 +191,7 @@ export interface LauncherApi {
   cancelTurns(): Promise<{ stdout: string }>;
   uninstallIntegration(): Promise<{ cancelled: true } | { cancelled: false; state: LauncherState }>;
   setupCore(): Promise<{ ok: boolean; stdout: string; restartRequired: boolean }>;
+  checkModels(): Promise<ModelCheckReport>;
   setupMcp(input: {
     tunnelId?: string;
     runtimeKey?: string;

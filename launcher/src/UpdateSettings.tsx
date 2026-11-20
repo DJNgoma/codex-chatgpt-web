@@ -23,6 +23,7 @@ export function UpdateSettings({ copy, language, update, version, onCheck, setEr
   const busy = checking || update.status === "downloading" || update.status === "installing";
   const message = update.status === "error" ? update.message
     : update.status === "up-to-date" ? copy.upToDate
+    : update.status === "review-required" ? copy.updateReviewRequired.replace("{version}", update.version)
     : "version" in update ? `${copy.updateAvailable} v${update.version}`
     : `v${version}`;
   const check = async () => {
@@ -35,6 +36,7 @@ export function UpdateSettings({ copy, language, update, version, onCheck, setEr
     <div>
       <strong>{copy.updates}</strong>
       <p role="status">{message}</p>
+      {update.status === "review-required" ? <p>{copy.updateReviewHelp}</p> : null}
       {retryAt && retryAt > now ? <p>{copy.updateRetryAfter.replace("{time}",
         new Date(retryAt).toLocaleString(language))}</p> : null}
     </div>

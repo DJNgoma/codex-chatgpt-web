@@ -16,6 +16,7 @@ import {
   extractChatGptNativeCompactionEnvironment,
   hasRawChatGptEnvironmentContext,
   unattributedChatGptEnvironmentMessages,
+  currentChatGptCalendarPreamble,
   isChatGptCompactionContinuation,
   MissingTrustedCodexEnvironmentError,
   type ChatGptEnvironmentClaim,
@@ -211,15 +212,17 @@ export class ChatGptThreadEnvironmentStore {
       // Root tasks also retain unattributed environment fragments after compaction.
       // They are historical only when the exact native record predates this task;
       // neither the fragment nor the cache supplies the current authority.
+      const calendarPreamble = hasCurrentContext && !currentCompaction && !initialClaim
+        ? currentChatGptCalendarPreamble(parsed) : undefined;
       const historicalMessages = hasCurrentContext && !currentCompaction && !initialClaim
-        ? unattributedChatGptEnvironmentMessages(parsed) : undefined;
+        ? unattributedChatGptEnvironmentMessages(parsed, calendarPreamble?.id) : undefined;
       const steeringClaim = hasCurrentContext && !currentCompaction
         ? extractChatGptSteeringEnvironmentClaim(parsed) : undefined;
       const calendarDelta = hasCurrentContext && !currentCompaction
         ? extractChatGptCalendarEnvironmentDelta(parsed) : undefined;
       const nativeCompaction = hasCurrentContext && !currentCompaction && !initialClaim && !steeringClaim && !calendarDelta
         ? extractChatGptNativeCompactionEnvironment(parsed) : undefined;
-      if (hasCurrentContext && !currentCompaction && !initialClaim && !historicalMessages && !steeringClaim && !calendarDelta && !nativeCompaction) {
+      if (hasCurrentContext && !currentCompaction && !initialClaim && !historicalMessages?.length && !calendarPreamble && !steeringClaim && !calendarDelta && !nativeCompaction) {
         console.warn("[chatgpt-web] trusted_environment_recovery rejected=unrecognized_current_context");
         throw error;
       }
@@ -239,7 +242,8 @@ export class ChatGptThreadEnvironmentStore {
           lineage: rolloutIdentity,
           turnId: identity.turnId,
           ...(compactionSourceTurnId ? { compactionSourceTurnId } : {}),
-          ...(historicalMessages ? { historicalEnvironmentMessages: historicalMessages } : {}),
+          ...(historicalMessages?.length ? { historicalEnvironmentMessages: historicalMessages } : {}),
+          ...(calendarPreamble ? { currentCalendarPreamble: calendarPreamble } : {}),
           ...(nativeCompaction ? { compactedEnvironmentItems: nativeCompaction.items } : {}),
           tools: parsed.context.tools,
         });

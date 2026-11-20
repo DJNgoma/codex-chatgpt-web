@@ -76,6 +76,7 @@ for (const language of Object.keys(languages).filter(language => language !== "e
   );
   for (const [message, translated] of [
     ["This runtime has not observed a completed Codex model-list request yet", copy.doctorCatalogPending],
+    ["Codex uses the verified external model catalogue; no runtime model-list request is required", copy.doctorCatalogExternal],
     ["Codex's latest model-list request succeeded", copy.doctorCatalogReady],
     ["Codex's latest model-list request failed; the local runtime is reachable", copy.doctorCatalogFailed],
   ]) {

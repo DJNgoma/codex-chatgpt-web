@@ -37,6 +37,12 @@ test("update settings show failures and reset time in every language and allow a
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(checks, 1);
     assert.equal(render({ status: "up-to-date" }).find(node => node.props?.role === "status").children[0], copy.upToDate);
+    nodes = render({ status: "review-required", version: "6.2.0" });
+    assert.equal(nodes.find(node => node.props?.role === "status").children[0],
+      copy.updateReviewRequired.replace("{version}", "6.2.0"));
+    assert.ok(nodes.some(node => node.type === "p" && node.children[0] === copy.updateReviewHelp));
+    assert.equal(nodes.filter(node => node.type === "button").length, 1);
+    assert.equal(nodes.find(node => node.type === "button").children[0], copy.checkUpdates);
     for (const status of ["checking", "downloading", "installing"]) {
       assert.equal(render({ status, version: "6.1.17" }).find(node => node.type === "button").props.disabled, true);
     }

@@ -548,3 +548,44 @@ test("manual retry recovers an exhausted startup check without an extra schedule
   assert.equal(calls, 2);
   assert.equal(controller.getState().status, "up-to-date");
 });
+
+
+test("coexistence builds still evaluate releases but reject upstream replacement before download", async () => {
+  const calls = [];
+  const states = [];
+  const controller = createUpdateController({
+    currentVersion: "6.1.18", platform: "darwin", arch: "arm64", packaged: true,
+    localBuildPolicy: { localProviderCoexistence: true, updateInstallPolicy: "reviewed-compatible-build-only" },
+    publish: state => states.push(state.status),
+    dependencies: {
+      fetchRelease: async () => {
+        calls.push("check");
+        return { tag_name: "v6.1.19", assets:
+          ["codex-web-gpt-6.1.19-mac-arm64.zip", "checksums.txt"].map(name => ({
+            name, browser_download_url: `https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.19/${name}`,
+          })),
+        };
+      },
+      downloadText: async () => { calls.push("checksums"); throw new Error("Unexpected download"); },
+      downloadFile: async () => { calls.push("asset"); },
+      extractMac: () => { calls.push("extract"); },
+      spawnWorker: () => { calls.push("worker"); },
+    },
+  });
+  assert.deepEqual(await controller.checkOnce(), { status: "review-required", version: "6.1.19" });
+  await assert.rejects(controller.beginInstall(), /local provider coexistence repair.*reviewed compatible build/i);
+  assert.deepEqual(calls, ["check"]);
+  assert.deepEqual(states, ["checking", "review-required"]);
+  assert.deepEqual(controller.getState(), { status: "review-required", version: "6.1.19" });
+  assert.deepEqual(await controller.checkNow(), { status: "review-required", version: "6.1.19" });
+  assert.deepEqual(calls, ["check", "check"]);
+});
+
+test("packaged coexistence marker is wired into the launcher updater", () => {
+  const manifest = require("../package.json");
+  assert.deepEqual(manifest.localBuildPolicy, {
+    localProviderCoexistence: true, updateInstallPolicy: "reviewed-compatible-build-only",
+  });
+  const main = fs.readFileSync(path.join(__dirname, "../electron/main.cjs"), "utf8");
+  assert.match(main, /localBuildPolicy: require\("\.\.\/package\.json"\)\.localBuildPolicy/);
+});

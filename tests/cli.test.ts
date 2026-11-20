@@ -48,7 +48,7 @@ test("doctor distinguishes a healthy local proxy from failed, pending and recove
   mkdirSync(appHome, { recursive: true });
   writeFileSync(join(appHome, "config.json"), JSON.stringify(config));
   mkdirSync(join(root, "codex"), { recursive: true });
-  const codexSettings = 'model="chatgpt-web/gpt-6-sol"\nmodel_auto_compact_token_limit=150000\n';
+  let codexSettings = 'model="chatgpt-web/gpt-6-sol"\nmodel_auto_compact_token_limit=150000\n';
   writeFileSync(join(root, "codex", "config.toml"), codexSettings);
   const env = { ...process.env, CODEX_CHATGPT_WEB_HOME: appHome, CODEX_HOME: join(root, "codex") };
   try {
@@ -65,6 +65,35 @@ test("doctor distinguishes a healthy local proxy from failed, pending and recove
     result = { request: 3, at: "2026-10-22T07:54:00Z", status: 200 };
     expect(await check()).toMatchObject({ status: "ok" });
     expect(paths).toEqual(["/healthz", "/healthz", "/healthz"]);
+    result = null;
+    const catalogPath = join(root, "external-catalog.json");
+    const visibleCatalog = JSON.stringify({ models: [{ slug: "chatgpt-web-6-sol", visibility: "list" }] });
+    writeFileSync(catalogPath, visibleCatalog);
+    const proxySettings = codexSettings + 'model_provider = "local_model_bridge"\n'
+      + `model_catalog_json = ${JSON.stringify(catalogPath)}\n`
+      + '[model_providers.local_model_bridge]\nbase_url = "http://127.0.0.1:48111/v1"\n';
+    codexSettings = proxySettings;
+    writeFileSync(join(root, "codex", "config.toml"), codexSettings);
+    expect(await check()).toMatchObject({
+      status: "ok",
+      message: "Codex uses the verified external model catalogue; no runtime model-list request is required",
+    });
+    expect(readFileSync(catalogPath, "utf8")).toBe(visibleCatalog);
+    for (const invalid of [proxySettings.replace("48111", "48112"), proxySettings.replaceAll("local_model_bridge", "other_provider")]) {
+      codexSettings = invalid;
+      writeFileSync(join(root, "codex", "config.toml"), codexSettings);
+      expect(await check()).toMatchObject({ status: "warning" });
+    }
+    codexSettings = proxySettings;
+    writeFileSync(join(root, "codex", "config.toml"), codexSettings);
+    for (const invalid of ["invalid-json", JSON.stringify({ models: [] }), JSON.stringify({ models: [{ slug: "chatgpt-web-6-sol", visibility: "hide" }] })]) {
+      writeFileSync(catalogPath, invalid);
+      expect(await check()).toMatchObject({ status: "warning" });
+    }
+    writeFileSync(catalogPath, visibleCatalog);
+    result = { status: 502, failure: { stage: "transport", code: "ConnectionRefused" } };
+    expect(await check()).toMatchObject({ status: "error", detail: "HTTP 502; transport; ConnectionRefused" });
+    expect(paths.every(path => path === "/healthz")).toBeTrue();
   } finally { server.stop(true); rmSync(root, { recursive: true, force: true }); }
 });
 
