@@ -81,6 +81,71 @@ async function snapshots(html: string, changes: Array<(document: Document) => vo
   }
 }
 
+const followupFixture = (root = 'data-markdown-text-style="assistant-message"') => `<section id="turn"><div data-content-search-unit-key="answer"><h4 data-conversation-role="assistant"></h4><div ${root}>
+<p>The report is complete.</p>
+<div class="relative min-w-0 px-3"><div class="flex min-w-0 flex-col items-start">
+<button class="group/suggested-followup"><span>Clarify the result</span></button>
+<button class="group/suggested-followup"><span>Shorten the report</span></button>
+</div><div aria-hidden="true" class="pointer-events-none start-0 top-0 w-max">
+<div><span>Clarify the result</span><span>Shorten the report</span></div>
+</div></div></div></div><button data-testid="copy-turn-action-button" aria-label="Copy"></button></section>`;
+
+test("#974 remounting captured Mermaid previews cannot interrupt the surrounding answer", async () => {
+  const captured = readFileSync(new URL("./fixtures/chatgpt-mermaid-preview-2026-11-10.html", import.meta.url), "utf8");
+  const code = '<pre><code class="language-mermaid">flowchart TD\n  A --&gt; B</code></pre>';
+  const html = `<section id="turn"><div class="markdown">${captured}${code}<p id="tail">Final text.</p></div></section>`;
+  const frames = await snapshots(html, [doc => {
+    // A new node has no source offsets; its empty rendered shell must not become answer text.
+    for (const preview of Array.from(doc.querySelectorAll('[data-chatgpt-mermaid-preview]'))) {
+      preview.outerHTML = preview.outerHTML;
+    }
+  }, doc => { doc.querySelector("h2")!.textContent = "Changed answer heading."; }]);
+  const buffer = new ChatGptMarkdownBuffer(undefined, 0);
+  const delivered = buffer.observe(frames[0]!.markdownSegments, 0);
+  expect(delivered).toContain("## 1\\. Architecture");
+  expect(delivered).toContain("```mermaid\nflowchart TD\n  A --> B\n```");
+  expect(buffer.observe(frames[1]!.markdownSegments, 1)).toBe("");
+  expect(buffer.finish()).toEqual({ markdown: `${delivered}\n\nFinal text.`, delta: "\n\nFinal text." });
+  expect(frames[1]!.fullHtml).not.toContain("data-chatgpt-mermaid-preview");
+  buffer.observe(frames[2]!.markdownSegments, 2);
+  expect(() => buffer.finish()).toThrow(ChatGptMarkdownConsistencyError);
+});
+
+test("suggested follow-up sizing copies stay out of the answer", async () => {
+  for (const root of ['class="markdown"', 'data-markdown-text-style="assistant-message"']) {
+    const result = await snapshot(followupFixture(root));
+    expect(result.visibleText).toBe("The report is complete.");
+    expect(chatGptHtmlToMarkdown(result.fullHtml)).toBe("The report is complete.");
+    expect(result.markdownSegments.map(segment => segment.text).join("\n")).not.toContain("Clarify the result");
+    expect(result.fullHtml).not.toContain("Shorten the report");
+    expect(result.completionActionVisible).toBeTrue();
+  }
+});
+
+test("changing follow-up sizing labels cannot rewrite delivered answer text", async () => {
+  const [before, after] = await snapshots(followupFixture(), [document => {
+    document.querySelector('[aria-hidden="true"] span')!.textContent = "A hydrated suggestion";
+  }]);
+  expect(before!.visibleText).toBe("The report is complete.");
+  expect(after!.visibleText).toBe(before!.visibleText);
+  expect(after!.fullHtml).toBe(before!.fullHtml);
+  const buffer = new ChatGptMarkdownBuffer(undefined, 0);
+  buffer.observe(before!.markdownSegments, 0);
+  buffer.observe(after!.markdownSegments, 1);
+  expect(buffer.finish().markdown).toBe("The report is complete.");
+});
+
+test("follow-up filtering preserves unrelated content and file-reference labels", async () => {
+  const html = followupFixture().replace('<p>The report is complete.</p>', `<p>The report is complete.</p>
+<p><span aria-hidden="true">Unrelated answer content.</span><button class="behavior-btn entity-underline">report.pdf</button></p>
+<pre><code>&lt;button class="group/suggested-followup"&gt;example&lt;/button&gt;</code></pre>`);
+  const result = await snapshot(html);
+  expect(result.visibleText).toContain("Unrelated answer content.");
+  expect(result.visibleText).toContain("report.pdf");
+  expect(chatGptHtmlToMarkdown(result.fullHtml)).toContain('class="group/suggested-followup"');
+  expect(result.visibleText).not.toContain("Clarify the result");
+});
+
 test("captured Activity progress is commentary before any assistant answer exists", async () => {
   const progress = await snapshot(powerActivityHtml);
   expect(progress.responsePresent).toBeTrue();
@@ -663,6 +728,53 @@ test("a known answer node cannot move its source range and be emitted again", as
   expect(buffer.observe(before!.markdownSegments, 0)).toBe("First paragraph.");
   expect(buffer.observe(shifted!.markdownSegments, 1)).toBe("");
   expect(() => buffer.finish()).toThrow(ChatGptMarkdownConsistencyError);
+});
+
+test("remounted Mermaid preview shells do not break alignment while separate Mermaid code stays intact (#974)", async () => {
+  const mermaidPreview = `<div class="group/app-widget relative" data-chatgpt-mermaid-preview="" data-search-result-target="">
+    <div data-block-actions="true" data-markdown-copy="exclude">
+      <button type="button" aria-label="Diagram options"></button>
+      <button type="button" aria-label="Expand diagram"></button>
+    </div>
+    <div data-code-block-preview-pane="mermaid"><div><svg><text>Node A</text></svg></div></div>
+  </div>`;
+  const html = `<section id="turn"><div class="markdown">
+    <p>It keeps each worker within its context window.</p>
+    <h2>1. Architecture</h2>
+    ${mermaidPreview}
+    <pre><code class="language-mermaid">graph TD;\nA--&gt;B;</code></pre>
+    <h2>2. Recursive task decomposition</h2>
+    <p>Committed explanation.</p>
+    <p>Final paragraph.</p>
+  </div></section>`;
+  const [initial, remounted] = await snapshots(html, [doc => {
+    const existing = doc.querySelector("[data-chatgpt-mermaid-preview]")!;
+    const replacement = existing.cloneNode(true);
+    const duplicate = existing.cloneNode(true);
+    existing.replaceWith(replacement, duplicate);
+  }]);
+  const buffer = new ChatGptMarkdownBuffer(undefined, 0);
+  const streamed = buffer.observe(initial!.markdownSegments, 0);
+  expect(streamed).toContain(String.raw`## 1\. Architecture`);
+  expect(streamed).toContain("```mermaid\ngraph TD;\nA-->B;\n```");
+  expect(streamed).toContain(String.raw`## 2\. Recursive task decomposition` + "\n\nCommitted explanation.");
+  expect(buffer.observe(remounted!.markdownSegments, 1)).toBe("");
+  expect(buffer.finish().markdown).toBe(
+    "It keeps each worker within its context window.\n\n"
+    + String.raw`## 1\. Architecture` + "\n\n"
+    + "```mermaid\ngraph TD;\nA-->B;\n```\n\n"
+    + String.raw`## 2\. Recursive task decomposition` + "\n\n"
+    + "Committed explanation.\n\n"
+    + "Final paragraph.",
+  );
+
+  const codeView = await snapshot(`<section id="turn"><div class="markdown">
+    <div data-chatgpt-mermaid-preview="">
+      <div data-block-actions="true" data-markdown-copy="exclude">Diagram options</div>
+      <div data-markdown-copy="code-block"><code class="language-mermaid">flowchart LR\nX--&gt;Y</code></div>
+    </div>
+  </div></section>`);
+  expect(chatGptHtmlToMarkdown(codeView.fullHtml)).toBe("```mermaid\nflowchart LR\nX-->Y\n```");
 });
 
 test("repeated text cannot rebind a known node to another committed source range", async () => {

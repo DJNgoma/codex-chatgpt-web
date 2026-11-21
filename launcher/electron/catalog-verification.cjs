@@ -2,7 +2,9 @@
 // Keep that disk evidence separate from observed runtime requests in both state and reports.
 function catalogVerificationPatch(state, picker, health) {
   if (state.coreSetupComplete !== true || picker.readable !== true) return null;
-  if (picker.source === "external" && picker.models.length > 0) {
+  // Hidden rows are installed but absent from the picker, so they are not evidence of a usable
+  // catalogue. A row with no visibility recorded is treated as listed.
+  if (picker.source === "external" && picker.models.some(model => model?.visible !== false)) {
     return {
       codexCatalogVerified: true,
       codexCatalogVerificationSource: "external-model-catalog",

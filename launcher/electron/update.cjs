@@ -135,7 +135,28 @@ function createUpdateDownloader(createRequest, idleTimeoutMs = 60_000) {
         request.end();
       });
       if (failure) throw failure;
-      if (response.statusCode !== 200) throw new Error(`Update download failed with HTTP ${response.statusCode}`);
+      if (response.statusCode !== 200) {
+        const error = new Error(`Update download failed with HTTP ${response.statusCode}`);
+        const header = name => {
+          const value = response.headers?.[name];
+          return Array.isArray(value) ? value[0] : value;
+        };
+        if (url === RELEASE_API_URL && (response.statusCode === 429
+          || (response.statusCode === 403 && header("x-ratelimit-remaining") === "0"))) {
+          error.message = "GitHub temporarily limited update checks. Please try again later.";
+          const reset = header("x-ratelimit-reset");
+          const after = header("retry-after");
+          const now = Date.now();
+          const retryAt = typeof after === "string" && /^\d+$/.test(after)
+            ? now + Number(after) * 1000
+            : typeof reset === "string" && /^\d+$/.test(reset) ? Number(reset) * 1000 : NaN;
+          // Only GitHub's bounded numeric headers control scheduling; never copy its response body.
+          if (Number.isSafeInteger(retryAt) && retryAt > now && retryAt - now <= 24 * 60 * 60_000) {
+            error.retryAt = retryAt + 1000;
+          }
+        }
+        throw error;
+      }
       armTimeout();
       for await (const chunk of response) {
         armTimeout();
@@ -300,6 +321,7 @@ function defaultDependencies() {
 
 function createUpdateController({
   currentVersion,
+  localBuildPolicy,
   platform,
   arch,
   packaged,
@@ -312,12 +334,16 @@ function createUpdateController({
   dependencies = {},
 }) {
   const deps = { ...defaultDependencies(), ...dependencies };
+  const requiresReview = localBuildPolicy?.localProviderCoexistence === true
+    || localBuildPolicy?.updateInstallPolicy === "reviewed-compatible-build-only";
   const supportedAsset = releaseAssetName(currentVersion, platform, arch);
   let state = packaged && supportedAsset ? { status: "idle" } : { status: "disabled" };
   let checked = false;
   let failedChecks = 0;
   let pending = null;
   let candidate = null;
+  let checkPending = null;
+  let retryTimer;
 
   const transition = (next) => {
     state = next;
@@ -328,7 +354,17 @@ function createUpdateController({
   async function checkOnce() {
     if (state.status === "disabled" || checked) return state;
     checked = true;
-    return check();
+    return checkNow();
+  }
+
+  function checkNow() {
+    if (checkPending) return checkPending;
+    if (["disabled", "downloading", "installing"].includes(state.status)
+      || (state.status === "error" && state.retryAt > Date.now())) return Promise.resolve(state);
+    clearTimeout(retryTimer);
+    checked = true;
+    checkPending = check().finally(() => { checkPending = null; });
+    return checkPending;
   }
 
   async function check() {
@@ -360,22 +396,24 @@ function createUpdateController({
         checksumsUrl: validateReleaseAssetUrl(checksums.browser_download_url, version, "checksums.txt"),
       };
       logger?.info("launcher.update_available", { currentVersion, version, platform, arch });
-      return transition({ status: "available", version });
+      return transition({ status: requiresReview ? "review-required" : "available", version });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const retryInMs = retryDelaysMs[failedChecks];
+      const retryAt = Number.isSafeInteger(error?.retryAt) && error.retryAt > Date.now()
+        ? error.retryAt : undefined;
+      const delay = retryDelaysMs[failedChecks];
+      const retryInMs = delay === undefined ? undefined : Math.max(delay, (retryAt ?? 0) - Date.now());
       failedChecks += 1;
       logger?.warn("launcher.update_check_failed", {
         message,
         ...(retryInMs !== undefined ? { retryInMs } : {}),
       });
-      const failed = transition({ status: "error", message });
+      const failed = transition({ status: "error", message, ...(retryAt ? { retryAt } : {}) });
       if (retryInMs !== undefined) {
-        const timer = setTimeout(() => {
-          // Only a still-failed check is repeated; nothing else leaves the error state.
-          if (state === failed) void check();
+        retryTimer = setTimeout(() => {
+          if (state === failed) void checkNow();
         }, retryInMs);
-        timer.unref?.();
+        retryTimer.unref?.();
       }
       return failed;
     }
@@ -383,6 +421,9 @@ function createUpdateController({
 
   async function beginInstall() {
     if (pending) throw new Error("An update is already being prepared");
+    if (requiresReview) {
+      throw new Error("The local provider coexistence repair requires a reviewed compatible build.");
+    }
     if (state.status !== "available" || !candidate) throw new Error("No launcher update is available");
     if (platform === "linux") linuxUpdateInstallation();
     const available = candidate;
@@ -447,6 +488,7 @@ function createUpdateController({
   return {
     getState: () => state,
     checkOnce,
+    checkNow,
     beginInstall,
     cancelInstall,
   };

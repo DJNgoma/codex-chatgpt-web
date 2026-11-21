@@ -1,17 +1,17 @@
-> **Personal fork.** This is `DJNgoma/codex-chatgpt-web`, kept to run Codex Web GPT beside a separate local model bridge. `main` is not the installed build. See [FORK_WORKFLOW.md](FORK_WORKFLOW.md) for the branch map, the local patch set and how a new upstream release is taken. For the product itself, use [miuuyy/codex-chatgpt-web](https://github.com/miuuyy/codex-chatgpt-web). The rest of this file is upstream's README as of 6.1.8.
+> **Personal fork.** This is `DJNgoma/codex-chatgpt-web`, kept to run Codex Web GPT beside a separate local model bridge. `main` is upstream 6.1.19 plus a small local patch set. See [FORK_WORKFLOW.md](FORK_WORKFLOW.md) for the branch map, what the patches are and how a new upstream release is taken, and [LOCAL_PROVIDER_REPAIR.md](LOCAL_PROVIDER_REPAIR.md) for the current build. For the product itself, use [miuuyy/codex-chatgpt-web](https://github.com/miuuyy/codex-chatgpt-web). The rest of this file is upstream's README.
 
 <p align="center">
   <img src="assets/readme/hero.svg" width="960" alt="Switch to web models. Stay in Codex. Your ChatGPT plan. Your workflow. Maximum capabilities.">
 </p>
 
 <p align="center">
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.8/codex-web-gpt-6.1.8-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.8/codex-web-gpt-6.1.8-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.8/codex-web-gpt-6.1.8-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
+  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.19/codex-web-gpt-6.1.19-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
+  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.19/codex-web-gpt-6.1.19-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
+  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.19/codex-web-gpt-6.1.19-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.8/codex-web-gpt-6.1.8-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/latest">All releases</a>
+  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.19/codex-web-gpt-6.1.19-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/latest">All releases</a>
 </p>
 
 <p align="center">
@@ -26,7 +26,7 @@
   <a href="#get-started">Get started</a> · <a href="https://github.com/miuuyy/codex-chatgpt-web/releases">What’s new</a> · <a href="docs/architecture.md">Architecture</a> · <a href="TROUBLESHOOTING.md">Troubleshooting</a>
 </p>
 
-Use the ChatGPT Web models available on your account, including Pro, from Codex’s native model picker—with ChatGPT Web’s separate usage limits, without spending your Work or Codex quota. Keep the same interface, tasks, images, and streaming.
+Use the ChatGPT Web models available on your account, including Pro, from Codex’s native model picker. Messages run through your signed-in ChatGPT Web session and are subject to the limits applied to that account. Keep the same interface, tasks, images, and streaming.
 
 Full harness mode connects ChatGPT to the current task’s files, terminal, tools, and approvals through MCP. Conversations stay tied to your Codex task, so you can keep working as the context grows.
 
@@ -85,6 +85,9 @@ Full mode connects ChatGPT's tool calls back to the current Codex task through t
 [OpenAI tunnel-client](https://github.com/openai/tunnel-client). The tunnel is outbound: it does
 not expose a public IP, open an inbound port, or require router forwarding.
 
+The launcher uses your system proxy for the tunnel. Explicitly configured proxy
+environment variables take priority; local connections stay local.
+
 The launcher's **MCP** page guides the complete setup. For the exact clicks, see the
 [video walkthroughs](TROUBLESHOOTING.md).
 
@@ -122,7 +125,10 @@ that option clicks **Allow once**, never a permanent grant.
 
 Use **Activity** for safe local diagnostics and **Settings → Run doctor** for end-to-end health.
 Settings can also cancel a retained browser turn or remove the Codex integration before uninstall.
-**Save chats in ChatGPT** keeps task conversations in ChatGPT history. Off by default; independent of **New browser chat for each turn**.
+**Settings → Temporary Chat** is on by default and keeps new task conversations out of ChatGPT
+history. Turn it off to use ordinary saved chats or if your connector is unavailable in that mode.
+ChatGPT memory and custom instructions may apply in either mode. **New browser chat for each turn**
+separately controls conversation reuse. An explicit choice to disable Temporary Chat is preserved when updating.
 Set `CODEX_CHATGPT_WEB_BROWSER_DIAGNOSTICS=1` only when every browser checkpoint needs a screenshot.
 
 New installs use **Compatibility V1** for cross-backend subagents. **Native** preserves Codex's own
@@ -156,7 +162,7 @@ Read the complete [architecture](docs/architecture.md) and
 [security model](docs/security-model.md) before enabling full mode. Report vulnerabilities through
 [SECURITY.md](SECURITY.md).
 
-Temporary Chat is a [ChatGPT privacy mode](https://help.openai.com/en/articles/8914046-temporary-chat-faq); prompts are still processed by OpenAI.
+Task prompts are processed by OpenAI and conversations remain in your ChatGPT history.
 
 Validation coverage: [release validation](docs/release-validation.md).
 

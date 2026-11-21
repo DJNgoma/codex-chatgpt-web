@@ -20,14 +20,32 @@ import type {
   ChatGptThreadSpawnLineage,
   ChatGptTurnEnvironment,
   ChatGptUnattributedEnvironmentMessage,
+  ChatGptCalendarPreamble,
 } from "./environment";
 
 type RolloutIdentity = ChatGptRootThreadMetadata | ChatGptThreadSpawnLineage;
 
+export interface CodexRolloutEnvironment {
+  environment: ChatGptTurnEnvironment;
+  workspaceRootsDeclared: boolean;
+  /** Native model-visible projection; never used to grant execution permissions. */
+  filesystemProfileXml?: string;
+  rolloutPath: string;
+  /**
+   * Unattributed environment messages proven only by this task's latest native compaction.
+   * Codex rebuilt them for the running turn, so they are current claims: the store must still
+   * compare them with this turn's native authority before the task may continue.
+   */
+  rebuiltPreambleMessages?: ChatGptUnattributedEnvironmentMessage[];
+}
+
 const CODEX_ID_SOURCE = "[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
 const CODEX_ID = new RegExp(`^${CODEX_ID_SOURCE}$`, "i");
 const ROLLOUT_READ_CHUNK_BYTES = 64 * 1024;
-const MAX_ROLLOUT_JSON_LINE_BYTES = 16 * 1024 * 1024;
+// Native compaction records carry the whole retained history in one line. They already exceed
+// 10 MiB on long tasks and grow with the task, and a single record over the bound fails every
+// later verification of that thread. The bound only limits memory for a damaged file.
+const MAX_ROLLOUT_JSON_LINE_BYTES = 64 * 1024 * 1024;
 const MAX_ROLLOUT_DIRECTORY_ENTRIES = 100_000;
 
 type IndexedRollout =
@@ -64,7 +82,7 @@ function canonicalRolloutName(name: string, threadId: string): boolean {
   ).test(name);
 }
 
-function configuredSqliteHome(codexHome: string, explicit?: string): string {
+function configuredSqliteHome(codexHome: string, explicit?: string, inheritEnvironment = true): string {
   if (explicit) return resolve(explicit);
 
   const configPath = join(codexHome, "config.toml");
@@ -80,7 +98,7 @@ function configuredSqliteHome(codexHome: string, explicit?: string): string {
     }
   }
 
-  const environmentValue = process.env.CODEX_SQLITE_HOME?.trim();
+  const environmentValue = inheritEnvironment ? process.env.CODEX_SQLITE_HOME?.trim() : undefined;
   return resolve(environmentValue ? expandUserPath(environmentValue) : codexHome);
 }
 
@@ -175,6 +193,54 @@ function parseJsonLine(line: Buffer): Record<string, unknown> {
   }
 }
 
+const TASK_STARTED_BYTES = Buffer.from("task_started");
+
+/**
+ * Visit every complete rollout record in file order; return true from `visit` to stop.
+ *
+ * Rollouts reach gigabytes and single records reach megabytes. A record that spans read chunks
+ * is kept as pieces and joined once, so its cost is one copy rather than one per chunk. The
+ * record passed to `visit` may alias the read buffer and is only valid during that call. An
+ * unterminated final record is never visited: Codex has not finished writing it.
+ */
+function forEachRolloutRecord(
+  fd: number,
+  size: number,
+  changedMessage: string,
+  visit: (line: Buffer) => boolean | void,
+): void {
+  const buffer = Buffer.allocUnsafe(ROLLOUT_READ_CHUNK_BYTES);
+  let pieces: Buffer[] = [];
+  let pendingBytes = 0;
+  let position = 0;
+  while (position < size) {
+    const length = Math.min(ROLLOUT_READ_CHUNK_BYTES, size - position);
+    if (readSync(fd, buffer, 0, length, position) !== length) throw new Error(changedMessage);
+    position += length;
+    const data = buffer.subarray(0, length);
+    let start = 0;
+    for (let end = data.indexOf(0x0a); end >= 0; end = data.indexOf(0x0a, start)) {
+      let line = data.subarray(start, end);
+      start = end + 1;
+      if (pendingBytes > 0) {
+        pieces.push(line);
+        line = Buffer.concat(pieces, pendingBytes + line.length);
+        pieces = [];
+        pendingBytes = 0;
+      }
+      if (!line.length) continue;
+      if (line.length > MAX_ROLLOUT_JSON_LINE_BYTES) throw new Error("Codex rollout JSONL record exceeds the bounded record size");
+      if (visit(line) === true) return;
+    }
+    if (start < length) {
+      // The read buffer is reused, so the unfinished tail has to be copied out of it.
+      pieces.push(Buffer.from(data.subarray(start)));
+      pendingBytes += length - start;
+      if (pendingBytes > MAX_ROLLOUT_JSON_LINE_BYTES) throw new Error("Codex rollout JSONL record exceeds the bounded record size");
+    }
+  }
+}
+
 function firstRolloutRecord(fd: number, size: number): Record<string, unknown> {
   let position = 0;
   let buffered = Buffer.alloc(0);
@@ -194,27 +260,39 @@ function firstRolloutRecord(fd: number, size: number): Record<string, unknown> {
   throw new Error("Codex rollout has no complete session metadata record");
 }
 
-function latestTurnContext(fd: number, size: number): Record<string, unknown> | undefined {
+function latestRolloutPayload(
+  fd: number,
+  size: number,
+  type: "turn_context" | "compacted" | "world_state",
+  matches: (payload: Record<string, unknown> | undefined) => boolean = () => true,
+): Record<string, unknown> | undefined {
   let position = size;
-  let carry = Buffer.alloc(0);
+  // The part of the record being assembled that lies in later chunks, newest piece first.
+  // Joining once per record keeps a multi-megabyte line at one copy instead of one per chunk.
+  let later: Buffer[] = [];
+  let laterBytes = 0;
   let firstSegmentAtEof = true;
   const fileEndsWithNewline = (() => {
     if (size === 0) return false;
     const byte = Buffer.alloc(1);
     return readSync(fd, byte, 0, 1, size - 1) === 1 && byte[0] === 0x0a;
   })();
+  const chunk = Buffer.allocUnsafe(ROLLOUT_READ_CHUNK_BYTES);
 
   while (position > 0) {
     const length = Math.min(ROLLOUT_READ_CHUNK_BYTES, position);
     position -= length;
-    const chunk = Buffer.alloc(length);
     const count = readSync(fd, chunk, 0, length, position);
     if (count !== length) throw new Error("Codex rollout changed during authority lookup");
-    const data = Buffer.concat([chunk, carry]);
-    let lineEnd = data.length;
-    for (let index = data.length - 1; index >= 0; index -= 1) {
-      if (data[index] !== 0x0a) continue;
-      const line = data.subarray(index + 1, lineEnd);
+    let lineEnd = length;
+    for (let index = length - 1; index >= 0; index -= 1) {
+      if (chunk[index] !== 0x0a) continue;
+      let line = chunk.subarray(index + 1, lineEnd);
+      if (laterBytes > 0) {
+        line = Buffer.concat([line, ...later.reverse()], line.length + laterBytes);
+        later = [];
+        laterBytes = 0;
+      }
       const trailingPartial = firstSegmentAtEof && !fileEndsWithNewline;
       firstSegmentAtEof = false;
       lineEnd = index;
@@ -223,61 +301,186 @@ function latestTurnContext(fd: number, size: number): Record<string, unknown> | 
         throw new Error("Codex rollout JSONL record exceeds the bounded record size");
       }
       const item = parseJsonLine(line);
-      if (item.type === "turn_context") return record(item.payload);
+      if (item.type === type && matches(record(item.payload))) return record(item.payload);
     }
-    carry = Buffer.from(data.subarray(0, lineEnd));
-    if (carry.length > MAX_ROLLOUT_JSON_LINE_BYTES) {
-      throw new Error("Codex rollout JSONL record exceeds the bounded record size");
+    if (lineEnd > 0) {
+      // The read buffer is reused, so the unfinished head has to be copied out of it.
+      later.push(Buffer.from(chunk.subarray(0, lineEnd)));
+      laterBytes += lineEnd;
+      if (laterBytes > MAX_ROLLOUT_JSON_LINE_BYTES) {
+        throw new Error("Codex rollout JSONL record exceeds the bounded record size");
+      }
     }
   }
-  if (carry.length === 0) return undefined;
-  const item = parseJsonLine(carry);
-  return item.type === "turn_context" ? record(item.payload) : undefined;
+  if (laterBytes === 0) return undefined;
+  const item = parseJsonLine(Buffer.concat(later.reverse(), laterBytes));
+  return item.type === type && matches(record(item.payload)) ? record(item.payload) : undefined;
 }
 
+/**
+ * The rendered filesystem of the primary environment, which holds its current workspace roots.
+ * Desktop rollouts record those roots nowhere else: turn_context omits them and session_meta keeps
+ * the ones the task started with. Codex renders the whole element into both the model-visible
+ * envelope and world_state, whose partial records are JSON merge patches; see
+ * codex-rs/core/src/context/world_state/environment.rs (rust-v0.166.0). Compared only, never parsed.
+ */
+export function latestCodexRolloutFilesystem(rolloutPath: string): string | undefined {
+  const fd = openSync(rolloutPath, "r");
+  try {
+    const latest = latestRolloutPayload(fd, fstatSync(fd).size, "world_state", payload => {
+      const environments = record(payload?.state)?.environments;
+      return payload?.full === true || environments === null
+        || (record(environments) !== undefined && "filesystem" in record(environments)!);
+    });
+    const filesystem = record(record(latest?.state)?.environments)?.filesystem;
+    return typeof filesystem === "string" ? filesystem : undefined;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function verifyCompactedEnvironmentItems(fd: number, size: number, items: Record<string, unknown>[]): void {
+  const compacted = latestRolloutPayload(fd, size, "compacted");
+  const history = Array.isArray(compacted?.replacement_history) ? compacted.replacement_history : [];
+  let previousIndex = -1;
+  for (const item of items) {
+    const matches = history.flatMap((value, index) => record(value)?.id === item.id ? [{ value, index }] : []);
+    if (matches.length !== 1 || matches[0]!.index <= previousIndex || !isDeepStrictEqual(matches[0]!.value, item)) {
+      throw new Error("Environment message or checkpoint differs from the latest native compaction");
+    }
+    previousIndex = matches[0]!.index;
+  }
+}
+
+/** Accept only a native initial preamble between this task boundary and its turn context.
+ * The date fragment grants no filesystem permissions; those still come from turn_context.
+ */
+function verifyCurrentCalendarPreamble(fd: number, size: number, turnId: string, message: ChatGptCalendarPreamble): void {
+  let currentTask = false;
+  let matched = false;
+  let calendarMatched = false;
+  let authenticated = false;
+  forEachRolloutRecord(fd, size, "Codex rollout changed during calendar preamble lookup", line => {
+    // Outside the task only a task boundary changes anything, and every boundary names itself.
+    // Skipping the rest spares parsing the megabyte records that make up most of a long rollout.
+    if (!currentTask && !line.includes(TASK_STARTED_BYTES)) return;
+    const item = parseJsonLine(line);
+    const payload = record(item.payload);
+    if (item.type === "event_msg" && payload?.type === "task_started") {
+      currentTask = payload.turn_id === turnId;
+      matched = false;
+      calendarMatched = false;
+    }
+    if (!currentTask) return;
+    if (item.type === "response_item" && payload?.id === message.id) {
+      if (matched || payload.type !== "message" || payload.role !== "user"
+        || !isDeepStrictEqual(payload.content, message.content)) throw new Error("Calendar preamble differs from its native Codex record");
+      matched = true;
+    }
+    if (item.type === "world_state" && matched && payload?.full === true) {
+      const calendar = record(record(payload.state)?.environments);
+      calendarMatched = calendar?.current_date === message.currentDate && calendar?.timezone === message.timezone;
+    }
+    if (item.type === "turn_context") {
+      if (payload?.turn_id === turnId && matched && calendarMatched) {
+        authenticated = true;
+        return true;
+      }
+      throw new Error("Codex rollout does not authenticate the current calendar preamble");
+    }
+  });
+  if (!authenticated) throw new Error("Codex rollout does not authenticate the current calendar preamble");
+}
+
+/** One native user message with this id and exactly this content, or no proof at all. */
+function replacementHistoryProves(history: unknown, id: string, content: unknown): boolean {
+  if (!Array.isArray(history)) return false;
+  const matches = history.filter(value => record(value)?.id === id);
+  const match = record(matches[0]);
+  return matches.length === 1 && match?.type === "message" && match.role === "user"
+    && isDeepStrictEqual(match.content, content);
+}
+
+/**
+ * Prove every unattributed environment message against the canonical rollout.
+ *
+ * A message is historical when its exact native record predates this task: an ordinary
+ * response item, or the replacement history of an earlier native compaction. Codex 0.171 also
+ * rebuilds the AGENTS.md + environment preamble inside a mid-turn compaction; that item exists
+ * only in the compacted record's replacement history and its wire copy carries no provenance.
+ * With `allowCurrentCompaction`, such a message is accepted only from the latest compaction of
+ * this very task and is returned to the caller, which must treat it as a current claim. An
+ * ordinary response item recorded after the task boundary never becomes historical.
+ */
 function verifyHistoricalEnvironmentMessages(
   fd: number,
   size: number,
   turnId: string,
   messages: ChatGptUnattributedEnvironmentMessage[],
-): void {
+  options: { allowCurrentCompaction?: boolean } = {},
+): ChatGptUnattributedEnvironmentMessage[] {
   const pending = new Map(messages.map(message => [message.id, message.content]));
   if (pending.size !== messages.length) throw new Error("Codex environment history repeats a message id");
-  let position = 0;
-  let carry = Buffer.alloc(0);
-  while (position < size) {
-    const length = Math.min(ROLLOUT_READ_CHUNK_BYTES, size - position);
-    const chunk = Buffer.alloc(length);
-    if (readSync(fd, chunk, 0, length, position) !== length) {
-      throw new Error("Codex rollout changed during environment history lookup");
+  // A record can prove or contradict a claim only if it carries that message id, and a task
+  // boundary always names itself. Before the boundary nothing else is parsed: most of a long
+  // rollout is megabyte compaction records about other messages. A record whose id is escaped
+  // or damaged simply proves nothing, which rejects the claim.
+  const claimedIds = messages.map(message => Buffer.from(message.id));
+  let currentTask = false;
+  let historical = false;
+  let superseded = false;
+  let rebuilt: Set<string> | undefined;
+  forEachRolloutRecord(fd, size, "Codex rollout changed during environment history lookup", line => {
+    if (!currentTask && !line.includes(TASK_STARTED_BYTES) && !claimedIds.some(id => line.includes(id))) return;
+    const item = parseJsonLine(line);
+    const payload = record(item.payload);
+    if (currentTask) {
+      // Past the boundary only this task's own compaction can prove anything. A later task
+      // boundary means the request does not describe the latest native task at all.
+      if (item.type === "event_msg" && payload?.type === "task_started") {
+        superseded = true;
+        return true;
+      }
+      if (item.type === "compacted") {
+        // Each compaction replaces the history Codex replays, so only the latest one counts.
+        rebuilt = new Set([...pending].filter(([id, content]) =>
+          replacementHistoryProves(payload?.replacement_history, id, content)).map(([id]) => id));
+      }
+      return;
     }
-    position += length;
-    const data = Buffer.concat([carry, chunk]);
-    let start = 0;
-    for (let end = data.indexOf(0x0a); end >= 0; end = data.indexOf(0x0a, start)) {
-      const line = data.subarray(start, end);
-      start = end + 1;
-      if (!line.length) continue;
-      if (line.length > MAX_ROLLOUT_JSON_LINE_BYTES) throw new Error("Codex rollout JSONL record exceeds the bounded record size");
-      const item = parseJsonLine(line);
-      const payload = record(item.payload);
-      // Core writes task_started before this turn's environment update. Merely finding matching
-      // XML somewhere in the file would also accept a current update as historical.
-      if (item.type === "event_msg" && payload?.type === "task_started" && payload.turn_id === turnId) {
-        if (pending.size === 0) return;
+    // Core writes task_started before this turn's environment update. Merely finding matching
+    // XML somewhere in the file would also accept a current update as historical.
+    if (item.type === "event_msg" && payload?.type === "task_started" && payload.turn_id === turnId) {
+      if (pending.size === 0) {
+        historical = true;
+        return true;
+      }
+      if (!options.allowCurrentCompaction) {
         throw new Error("Codex rollout does not authenticate the historical environment messages");
       }
-      if (item.type !== "response_item" || payload?.type !== "message" || payload.role !== "user"
-        || typeof payload.id !== "string" || !pending.has(payload.id)) continue;
-      if (!isDeepStrictEqual(payload.content, pending.get(payload.id))) {
-        throw new Error("Historical environment message differs from its native Codex record");
-      }
-      pending.delete(payload.id);
+      currentTask = true;
+      return;
     }
-    carry = Buffer.from(data.subarray(start));
-    if (carry.length > MAX_ROLLOUT_JSON_LINE_BYTES) throw new Error("Codex rollout JSONL record exceeds the bounded record size");
+    if (item.type === "compacted") {
+      for (const [id, content] of pending) {
+        if (replacementHistoryProves(payload?.replacement_history, id, content)) pending.delete(id);
+      }
+      return;
+    }
+    if (item.type !== "response_item" || payload?.type !== "message" || payload.role !== "user"
+      || typeof payload.id !== "string" || !pending.has(payload.id)) return;
+    if (!isDeepStrictEqual(payload.content, pending.get(payload.id))) {
+      throw new Error("Historical environment message differs from its native Codex record");
+    }
+    pending.delete(payload.id);
+  });
+  if (historical) return [];
+  if (!currentTask) throw new Error("Codex rollout has no current task boundary for environment history");
+  if (superseded || !rebuilt || rebuilt.size !== pending.size) {
+    throw new Error("Codex rollout does not authenticate the historical environment messages");
   }
-  throw new Error("Codex rollout has no current task boundary for environment history");
+  const proven = rebuilt;
+  return messages.filter(message => proven.has(message.id));
 }
 
 function validateSessionMeta(
@@ -499,6 +702,7 @@ function environmentFromTurnContext(
   payload: Record<string, unknown>,
   expectedTurnId: string,
   tools: readonly CodexTool[] | undefined,
+  runtimeWorkspaceRoots?: string[],
 ): ChatGptTurnEnvironment {
   if (payload.turn_id !== expectedTurnId) {
     throw new Error("Latest Codex rollout turn context does not belong to the requested turn");
@@ -508,15 +712,16 @@ function environmentFromTurnContext(
   }
   const cwd = resolve(payload.cwd);
   const declaredRoots = payload.workspace_roots === undefined
-    ? []
+    ? runtimeWorkspaceRoots ?? []
     : absolutePaths(payload.workspace_roots, "workspace_roots");
   const roots = declaredRoots.length > 0 ? declaredRoots : [cwd];
-  if (!roots.some(root => contains(root, cwd))) {
+  const permissionProfile = record(payload.permission_profile);
+  const sandbox = record(payload.sandbox_policy);
+  if (!roots.some(root => contains(root, cwd))
+    && !(permissionProfile?.type === "disabled" && sandbox?.type === "danger-full-access")) {
     throw new Error("Codex rollout cwd is outside its workspace roots");
   }
 
-  const permissionProfile = record(payload.permission_profile);
-  const sandbox = record(payload.sandbox_policy);
   if (!permissionProfile || !sandbox) {
     throw new Error("Codex rollout is missing its authoritative permission profile");
   }
@@ -579,9 +784,59 @@ function environmentFromTurnContext(
   throw new Error("Codex rollout permission profile cannot be represented safely by the Web bridge");
 }
 
+/**
+ * Codex's model-visible projection, after environmentFromTurnContext validates execution policy.
+ * See codex-rs/core/src/context/environment_context.rs (rust-v0.154.0): expand project roots,
+ * deduplicate full entries, omit missing_path_behavior, and mark deny entries non-escalatable.
+ * Comparing the whole projection keeps calendar updates from introducing different permissions.
+ */
+function renderFilesystemProfile(value: unknown, roots: string[]): string | undefined {
+  const profile = record(value);
+  if (profile?.type === "disabled") {
+    return '<permission_profile type="disabled"><file_system type="unrestricted" /></permission_profile>';
+  }
+  const fs = record(profile?.file_system);
+  if (profile?.type !== "managed" || fs?.type !== "restricted" || !Array.isArray(fs.entries)) return undefined;
+  const entries: Record<string, unknown>[] = [];
+  for (const raw of fs.entries) {
+    const entry = record(raw);
+    const path = record(entry?.path);
+    if (!entry || !path) return undefined;
+    const special = path.type === "special" ? record(path.value) : undefined;
+    const expanded = special?.kind === "project_roots"
+      ? roots.map(root => ({ ...entry, path: { type: "path", path: typeof special.subpath === "string" ? join(root, special.subpath) : root } }))
+      : [entry];
+    for (const candidate of expanded) {
+      if (!entries.some(prior => isDeepStrictEqual(prior, candidate))) entries.push(candidate);
+    }
+  }
+  const xml = (text: string): string => text.replace(/[&<>"']/g, char => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;",
+  })[char]!);
+  const rendered: string[] = [];
+  for (const entry of entries) {
+    const path = record(entry.path)!;
+    let tag: string;
+    let text: unknown;
+    if (path.type === "path") { tag = "path"; text = path.path; }
+    else if (path.type === "glob_pattern") { tag = "glob"; text = path.pattern; }
+    else if (path.type === "special") {
+      tag = "special";
+      const special = record(path.value);
+      if (!special || !["root", "minimal", "tmpdir", "slash_tmp"].includes(String(special.kind))) return undefined;
+      text = `:${special.kind}`;
+    } else return undefined;
+    if (typeof text !== "string") return undefined;
+    rendered.push(`<entry access="${entry.access}"${entry.access === "deny" ? ' escalatable="false"' : ""}><${tag}>${xml(text)}</${tag}></entry>`);
+  }
+  const depth = fs.glob_scan_max_depth === undefined ? "" : ` glob_scan_max_depth="${fs.glob_scan_max_depth}"`;
+  return `<permission_profile type="managed"><file_system type="restricted"${depth}>${rendered.join("")}</file_system></permission_profile>`;
+}
+
 function validateMetadataConsistency(
   lineage: RolloutIdentity,
   environment: ChatGptTurnEnvironment,
+  workspaceRootsDeclared: boolean,
 ): void {
   // Request sandbox/workspace fields are diagnostic only. They narrow a rollout-derived authority
   // here and never create or expand it.
@@ -595,22 +850,28 @@ function validateMetadataConsistency(
     && !lineage.workspaceRoots.some(root => contains(root, environment.cwd))) {
     throw new Error(`ChatGPT Web ${owner} workspace metadata does not contain its Codex rollout cwd`);
   }
-  if (lineage.workspaceRoots.some(root => !environment.roots.some(rolloutRoot => (
-    contains(rolloutRoot, root) || contains(root, rolloutRoot)
-  )))) {
+  if ((workspaceRootsDeclared || environment.sandboxPolicy.type !== "dangerFullAccess")
+    && lineage.workspaceRoots.some(root => (
+      !environment.roots.some(rolloutRoot => contains(rolloutRoot, root) || contains(root, rolloutRoot))
+      && !(environment.sandboxPolicy.type === "dangerFullAccess"
+        && pathIdentity(root) === pathIdentity(environment.cwd))
+    ))) {
     throw new Error(`ChatGPT Web ${owner} workspace metadata conflicts with its Codex rollout roots`);
   }
 }
 
 export function resolveCurrentCodexRolloutEnvironment(options: {
   codexHome: string;
+  additionalCodexHomes?: readonly string[];
   sqliteHome?: string;
   lineage: RolloutIdentity;
   turnId: string;
   compactionSourceTurnId?: string;
   tools?: readonly CodexTool[];
   historicalEnvironmentMessages?: ChatGptUnattributedEnvironmentMessage[];
-}): ChatGptTurnEnvironment | undefined {
+  currentCalendarPreamble?: ChatGptCalendarPreamble;
+  compactedEnvironmentItems?: Record<string, unknown>[];
+}): CodexRolloutEnvironment | undefined {
   const { codexHome, lineage, turnId, tools, compactionSourceTurnId } = options;
   const nativeThreadId = CODEX_ID.test(lineage.threadId);
   const nativeTurnId = CODEX_ID.test(turnId);
@@ -620,37 +881,68 @@ export function resolveCurrentCodexRolloutEnvironment(options: {
     throw new Error("Codex thread metadata contains an invalid native identifier");
   }
 
-  const indexed = indexedRollout(configuredSqliteHome(codexHome, options.sqliteHome), lineage);
-  const candidates = indexed.kind === "found"
-    ? [indexed.path]
-    : scanCanonicalRollouts(codexHome, lineage.threadId);
-  if (candidates.length === 0) {
+  // Establish one home before interpreting its permissions. Even a stale copy of
+  // the same thread in another registered home makes ownership ambiguous.
+  const owners = [codexHome, ...(options.additionalCodexHomes ?? [])].map((home, index) => {
+    const indexed = indexedRollout(configuredSqliteHome(
+      home, index === 0 ? options.sqliteHome : undefined, index === 0,
+    ), lineage);
+    const candidates = indexed.kind === "found" ? [indexed.path] : scanCanonicalRollouts(home, lineage.threadId);
+    return { home, indexed, candidates };
+  }).filter(owner => owner.candidates.length > 0);
+  if (owners.length > 1) throw new Error("Codex thread exists in multiple trusted homes");
+  const owner = owners[0];
+  if (!owner) {
     if (!("parentThreadId" in lineage)) return undefined;
     throw new Error("Codex has no canonical rollout for the requested subagent thread");
   }
 
-  const matching: ChatGptTurnEnvironment[] = [];
-  for (const candidate of candidates) {
-    const rolloutPath = validateRolloutPath(codexHome, candidate, lineage.threadId);
+  const matching: CodexRolloutEnvironment[] = [];
+  for (const candidate of owner.candidates) {
+    const rolloutPath = validateRolloutPath(owner.home, candidate, lineage.threadId);
     const fd = openSync(rolloutPath, "r");
     try {
       const size = fstatSync(fd).size;
       if (!Number.isSafeInteger(size) || size <= 0) throw new Error("Codex rollout is empty");
-      validateSessionMeta(firstRolloutRecord(fd, size), lineage);
-      const latest = latestTurnContext(fd, size);
+      const session = firstRolloutRecord(fd, size);
+      validateSessionMeta(session, lineage);
+      const sessionPayload = record(session.payload)!;
+      const runtimeWorkspaceRoots = sessionPayload.runtime_workspace_roots === undefined
+        ? undefined : absolutePaths(sessionPayload.runtime_workspace_roots, "runtime_workspace_roots");
+      const latest = latestRolloutPayload(fd, size, "turn_context");
       if (!latest) throw new Error("Codex rollout has no complete turn context");
       if (latest.turn_id !== turnId && (compactionSourceTurnId === undefined || latest.turn_id !== compactionSourceTurnId)) {
-        if (indexed.kind === "found") {
+        if (owner.indexed.kind === "found") {
           throw new Error("Latest Codex rollout turn context does not belong to the requested turn");
         }
         continue;
       }
-      const environment = environmentFromTurnContext(latest, latest.turn_id as string, tools);
-      validateMetadataConsistency(lineage, environment);
-      if (options.historicalEnvironmentMessages) {
-        verifyHistoricalEnvironmentMessages(fd, size, turnId, options.historicalEnvironmentMessages);
+      const environment = environmentFromTurnContext(latest, latest.turn_id as string, tools, runtimeWorkspaceRoots);
+      const workspaceRootsDeclared = latest.workspace_roots !== undefined || runtimeWorkspaceRoots !== undefined;
+      validateMetadataConsistency(lineage, environment, workspaceRootsDeclared);
+      if (options.currentCalendarPreamble) {
+        try {
+          verifyCurrentCalendarPreamble(fd, size, turnId, options.currentCalendarPreamble);
+        } catch (error) {
+          if (options.currentCalendarPreamble.currentTurnAttributed) throw error;
+          // Older calendar-only preambles remain contextual history if the unchanged
+          // historical verifier proves the exact native item before this task.
+          try { verifyHistoricalEnvironmentMessages(fd, size, turnId, [options.currentCalendarPreamble]); }
+          catch { throw error; }
+        }
       }
-      matching.push(environment);
+      const rebuiltPreambleMessages = options.historicalEnvironmentMessages
+        ? verifyHistoricalEnvironmentMessages(fd, size, turnId, options.historicalEnvironmentMessages,
+          { allowCurrentCompaction: true })
+        : [];
+      if (options.compactedEnvironmentItems) {
+        verifyCompactedEnvironmentItems(fd, size, options.compactedEnvironmentItems);
+      }
+      const filesystemProfileXml = renderFilesystemProfile(latest.permission_profile, environment.roots);
+      matching.push({
+        environment, workspaceRootsDeclared, filesystemProfileXml, rolloutPath,
+        ...(rebuiltPreambleMessages.length > 0 ? { rebuiltPreambleMessages } : {}),
+      });
     } finally {
       closeSync(fd);
     }

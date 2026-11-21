@@ -22,7 +22,7 @@ export interface LauncherState {
   composerPredictionsEnabled: boolean;
   experimentalSkillAttachments: boolean;
   experimentalFreshConversationPerTurn: boolean;
-  useSavedChats: boolean;
+  useTemporaryChats: boolean;
   zeroRiskProEnabled: boolean;
   sidebarOpen: boolean;
   sidebarWidth: number;
@@ -128,8 +128,8 @@ export interface OperationState {
 
 export type UpdateState =
   | { status: "disabled" | "idle" | "checking" | "up-to-date" }
-  | { status: "available" | "downloading" | "installing"; version: string }
-  | { status: "error"; message: string };
+  | { status: "available" | "review-required" | "downloading" | "installing"; version: string }
+  | { status: "error"; message: string; retryAt?: number };
 
 export interface LauncherSnapshot {
   profile: LauncherProfile;
@@ -178,10 +178,13 @@ export interface LauncherApi {
   copyManualPrompt(tabId: string): Promise<BrowserState>;
   confirmManualSent(tabId: string): Promise<BrowserState>;
   openLogin(): Promise<BrowserState>;
+  resetEmbeddedBrowserData(): Promise<BrowserState>;
   openPasskeyLogin(): Promise<BrowserState>;
   continuePasskeyLogin(): Promise<boolean>;
   logoutChatGpt(): Promise<{ browser: BrowserState; state: LauncherState }>;
   dismissSessionReminder(): Promise<LauncherState>;
+  setSessionReminderVisible(visible: boolean): Promise<void>;
+  onSessionReminderLogout(listener: () => void): () => void;
   smokeTest(): Promise<{ ok: boolean; effort: string; response: string }>;
   verifyMcp(): Promise<DoctorReport>;
   doctor(): Promise<DoctorReport>;
@@ -203,7 +206,7 @@ export interface LauncherApi {
   setSkillAttachments(enabled: boolean): Promise<LauncherState>;
   setAutoApproveToolCalls(enabled: boolean): Promise<LauncherState>;
   setFreshConversationPerTurn(enabled: boolean): Promise<LauncherState>;
-  setUseSavedChats(enabled: boolean): Promise<LauncherState>;
+  setTemporaryChats(enabled: boolean): Promise<LauncherState>;
   setZeroRiskPro(enabled: boolean): Promise<LauncherState>;
   setBrowserInteractionMode(mode: BrowserInteractionMode): Promise<{
     state: LauncherState;
@@ -218,6 +221,7 @@ export interface LauncherApi {
   logs(limit?: number): Promise<LogRecord[]>;
   exportLogs(): Promise<string | null>;
   installUpdate(): Promise<boolean>;
+  checkForUpdates(): Promise<UpdateState>;
   windowState(): Promise<{ fullScreen: boolean; maximized: boolean }>;
   windowControl(action: "close" | "minimize" | "zoom"): void;
   onWindowStateChanged(listener: (state: { fullScreen: boolean; maximized: boolean }) => void): () => void;
@@ -232,5 +236,11 @@ export interface LauncherApi {
 declare global {
   interface Window {
     codexWebLauncher?: LauncherApi;
+    codexSessionReminder?: {
+      language(): Promise<Language>;
+      resize(height: number): Promise<void>;
+      action(action: "dismiss" | "logout"): Promise<void>;
+      onLanguage(listener: (language: Language) => void): () => void;
+    };
   }
 }

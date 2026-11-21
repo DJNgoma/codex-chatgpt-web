@@ -26,7 +26,78 @@ async function runCli(args: string[], env: Record<string, string | undefined>) {
   return { exitCode, stdout, stderr };
 }
 
-test("production and DEV setup reject the removed connector-name option before configuration", async () => {
+test("doctor distinguishes a healthy local proxy from failed, pending and recovered model loading", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-doctor-catalog-"));
+  const appHome = join(root, "app");
+  const config = { ...defaultConfig("browser-only"), browserHost: "managed-chrome" as const };
+  let result: Record<string, unknown> | null = {
+    request: 2, at: "2026-10-22T07:53:53.739Z", status: 502,
+    failure: { stage: "transport", code: "ConnectionRefused", message: "PRIVATE_PROXY_URL" },
+  };
+  const paths: string[] = [];
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch(req) {
+    paths.push(new URL(req.url).pathname);
+    return Response.json({
+      status: "ok", service: "codex-chatgpt-web", version: config.releaseVersion,
+      mode: config.mode, accepting_turns: true, pid: process.pid,
+      successful_model_catalog_requests: result ? 1 : 0,
+      last_model_catalog_result: result,
+    });
+  } });
+  config.port = server.port!;
+  mkdirSync(appHome, { recursive: true });
+  writeFileSync(join(appHome, "config.json"), JSON.stringify(config));
+  mkdirSync(join(root, "codex"), { recursive: true });
+  let codexSettings = 'model="chatgpt-web/gpt-6-sol"\nmodel_auto_compact_token_limit=150000\n';
+  writeFileSync(join(root, "codex", "config.toml"), codexSettings);
+  const env = { ...process.env, CODEX_CHATGPT_WEB_HOME: appHome, CODEX_HOME: join(root, "codex") };
+  try {
+    const check = async () => {
+      const report = JSON.parse((await runCli(["doctor", "--json"], env)).stdout);
+      expect(report.checks.find((c: any) => c.id === "proxy").status).toBe("ok");
+      expect(report.checks.find((c: any) => c.id === "codex-compaction").status).toBe("warning");
+      expect(readFileSync(join(root, "codex", "config.toml"), "utf8")).toBe(codexSettings);
+      return report.checks.find((c: any) => c.id === "model-catalog");
+    };
+    expect(await check()).toMatchObject({ status: "error", detail: "HTTP 502; transport; ConnectionRefused" });
+    result = null;
+    expect(await check()).toMatchObject({ status: "warning" });
+    result = { request: 3, at: "2026-10-22T07:54:00Z", status: 200 };
+    expect(await check()).toMatchObject({ status: "ok" });
+    expect(paths).toEqual(["/healthz", "/healthz", "/healthz"]);
+    result = null;
+    const catalogPath = join(root, "external-catalog.json");
+    const visibleCatalog = JSON.stringify({ models: [{ slug: "chatgpt-web-6-sol", visibility: "list" }] });
+    writeFileSync(catalogPath, visibleCatalog);
+    const proxySettings = codexSettings + 'model_provider = "local_model_bridge"\n'
+      + `model_catalog_json = ${JSON.stringify(catalogPath)}\n`
+      + '[model_providers.local_model_bridge]\nbase_url = "http://127.0.0.1:48111/v1"\n';
+    codexSettings = proxySettings;
+    writeFileSync(join(root, "codex", "config.toml"), codexSettings);
+    expect(await check()).toMatchObject({
+      status: "ok",
+      message: "Codex uses the verified external model catalogue; no runtime model-list request is required",
+    });
+    expect(readFileSync(catalogPath, "utf8")).toBe(visibleCatalog);
+    for (const invalid of [proxySettings.replace("48111", "48112"), proxySettings.replaceAll("local_model_bridge", "other_provider")]) {
+      codexSettings = invalid;
+      writeFileSync(join(root, "codex", "config.toml"), codexSettings);
+      expect(await check()).toMatchObject({ status: "warning" });
+    }
+    codexSettings = proxySettings;
+    writeFileSync(join(root, "codex", "config.toml"), codexSettings);
+    for (const invalid of ["invalid-json", JSON.stringify({ models: [] }), JSON.stringify({ models: [{ slug: "chatgpt-web-6-sol", visibility: "hide" }] })]) {
+      writeFileSync(catalogPath, invalid);
+      expect(await check()).toMatchObject({ status: "warning" });
+    }
+    writeFileSync(catalogPath, visibleCatalog);
+    result = { status: 502, failure: { stage: "transport", code: "ConnectionRefused" } };
+    expect(await check()).toMatchObject({ status: "error", detail: "HTTP 502; transport; ConnectionRefused" });
+    expect(paths.every(path => path === "/healthz")).toBeTrue();
+  } finally { server.stop(true); rmSync(root, { recursive: true, force: true }); }
+});
+
+test("production and DEV setup reject retired options before configuration", async () => {
   const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-fixed-connector-"));
   try {
     const env = {
@@ -36,16 +107,22 @@ test("production and DEV setup reject the removed connector-name option before c
       CODEX_CHATGPT_WEB_DEV_HOME: join(root, "dev"),
     };
     for (const command of [["setup"], ["dev", "setup"]]) {
-      const result = await runCli([
-        ...command, "--browser-only", "--app-name", "Other Connector", "--acknowledge-unofficial",
-      ], env);
-      expect(result.exitCode).toBe(1);
-      expect(result.stderr).toMatch(/Unknown.*arguments: --app-name Other Connector/);
+      for (const option of [["--app-name", "Other Connector"], ["--saved-chats"]]) {
+        const result = await runCli([
+          ...command, "--browser-only", ...option, "--acknowledge-unofficial",
+        ], env);
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toMatch(/Unknown.*arguments:/);
+        expect(result.stderr).toContain(option.join(" "));
+      }
     }
     expect(existsSync(join(root, "app", "config.json"))).toBeFalse();
     expect(existsSync(join(root, "dev", "config.json"))).toBeFalse();
     const help = await runCli(["--help"], env);
     expect(help.stdout).not.toContain("--app-name");
+    expect(help.stdout).not.toContain("--saved-chats");
+    expect(help.stdout).toContain("--temporary-chats");
+    expect(help.stdout).toContain("--ordinary-chats");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -55,16 +132,18 @@ test("production and DEV setup reject conflicting conversation modes before conf
   const root = mkdtempSync(join(tmpdir(), "codex-web-conversation-flags-"));
   try {
     for (const command of [["setup"], ["dev", "setup"]]) {
-      const result = await runCli([
-        ...command, "--browser-only", "--fresh-conversation", "--retained-conversation",
-      ], {
-        ...process.env,
-        CODEX_HOME: join(root, "codex"),
-        CODEX_CHATGPT_WEB_HOME: join(root, "app"),
-        CODEX_CHATGPT_WEB_DEV_HOME: join(root, "dev"),
-      });
-      expect(result.exitCode).toBe(1);
-      expect(result.stderr).toContain("Choose --fresh-conversation or --retained-conversation");
+      for (const [enable, disable] of [["--fresh-conversation", "--retained-conversation"], ["--temporary-chats", "--ordinary-chats"]]) {
+        const result = await runCli([
+          ...command, "--browser-only", enable, disable,
+        ], {
+          ...process.env,
+          CODEX_HOME: join(root, "codex"),
+          CODEX_CHATGPT_WEB_HOME: join(root, "app"),
+          CODEX_CHATGPT_WEB_DEV_HOME: join(root, "dev"),
+        });
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toContain(`Choose ${enable} or ${disable}`);
+      }
     }
     expect(existsSync(join(root, "app", "config.json"))).toBeFalse();
     expect(existsSync(join(root, "dev", "config.json"))).toBeFalse();
@@ -327,10 +406,10 @@ test("DEV browser-only setup persists only the isolated harness profile", async 
     response.writeHead(200, { "content-type": "application/json" });
     response.end(JSON.stringify({
       authenticated: true,
-      temporary: true,
+      newChat: true,
       solAvailable: true,
       extraHighAvailable: false, proAvailable: false,
-      url: "https://chatgpt.com/?temporary-chat=true",
+      url: "https://chatgpt.com/",
     }));
   });
   await new Promise<void>((resolveListen, rejectListen) => {

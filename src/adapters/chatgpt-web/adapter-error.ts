@@ -36,6 +36,14 @@ export function chatGptResponseIncompleteError(message: string): ChatGptWebAdapt
   });
 }
 
+export function chatGptToolApprovalRequiredError(): ChatGptWebAdapterError {
+  return new ChatGptWebAdapterError(
+    "ChatGPT is waiting for plugin permission. Open the plugin's settings in ChatGPT, "
+    + 'then Permissions → Allow all actions, and retry this turn.',
+    { status: 403, errorType: "permission_error", code: "chatgpt_tool_approval_required", retryable: false },
+  );
+}
+
 // Only the compaction owner may signal this after the broker accepts its one-shot handoff.
 // It cancels browser observation, while the accepted summary remains the native result.
 export class ChatGptCompactionHandoffAccepted extends DOMException {
@@ -124,4 +132,45 @@ export function chatGptTurnAbortError(signal?: AbortSignal): DOMException {
     Object.defineProperty(error, "cause", { value: reason, configurable: true, writable: true });
   }
   return error;
+}
+
+/**
+ * A safe, bounded description of why a turn failed, for the runtime log.
+ *
+ * Codex is told that ChatGPT stopped responding whenever a submitted turn fails, whatever the
+ * reason was. The reason itself is an internal message, never request text, but it is still kept
+ * to one bounded line so it cannot flood the log or imitate another entry. This must not throw:
+ * diagnostics are a side channel and cannot be allowed to take the turn down.
+ */
+export function chatGptFailureCauseEvidence(error: unknown): { causeName: string; causeMessage: string; causeDepth: number } {
+  const field = (read: () => unknown, fallback: string): string => {
+    try {
+      const value = read();
+      return typeof value === "string" ? value : fallback;
+    } catch {
+      return fallback;
+    }
+  };
+  let current: unknown = error;
+  let depth = 0;
+  const seen = new Set<unknown>();
+  // Follow the cause chain to its origin; wrappers only restate the generic outcome.
+  for (;;) {
+    if (current === null || typeof current !== "object" || seen.has(current)) break;
+    seen.add(current);
+    let next: unknown;
+    try { next = (current as { cause?: unknown }).cause; } catch { break; }
+    if (next === undefined || next === null || seen.has(next)) break;
+    current = next;
+    depth += 1;
+  }
+  const isObject = current !== null && typeof current === "object";
+  const causeName = isObject
+    ? field(() => (current as { name?: unknown }).name, "Error")
+    : current === null ? "null" : typeof current;
+  const rawMessage = isObject
+    ? field(() => (current as { message?: unknown }).message, "")
+    : typeof current === "string" ? current : "";
+  const causeMessage = rawMessage.replace(/[\u0000-\u001f\u007f]+/g, " ").trim().slice(0, 240);
+  return { causeName: causeName.replace(/[\u0000-\u001f\u007f]+/g, " ").slice(0, 80), causeMessage, causeDepth: depth };
 }

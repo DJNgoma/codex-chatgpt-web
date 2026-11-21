@@ -1,10 +1,11 @@
+import { chatGptStopButton, chatGptThinkButtons } from "../src/chatgpt-ui/composer";
 import { expect, test } from "bun:test";
 import { chromium, _electron } from "playwright-core";
 import { readFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { chatGptStopButton, chatGptThinkButtons, ChatGptTurnDomHealthTracker, setChatGptThinkMode } from "../src/adapters/chatgpt-web/browser-worker";
-import { CHATGPT_THINK_BUTTON_SELECTOR } from "../src/chatgpt-session";
+import { ChatGptTurnDomHealthTracker, setChatGptThinkMode } from "../src/adapters/chatgpt-web/browser-worker";
+import { CHATGPT_THINK_BUTTON_SELECTOR } from "../src/chatgpt-ui/composer";
 
 test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("Think buttons do not require the 6.1.8 icon shape or type slash commands", async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
@@ -60,6 +61,42 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("Think buttons do not require
     await expect(setChatGptThinkMode(page.locator("#prompt-textarea"), true)).rejects.toThrow();
     expect(await page.evaluate(() => (window as any).actions)).toEqual(["click", "click", "click"]);
     expect(await page.locator("#prompt-textarea").innerText()).toBe("Codex Native2");
+  } finally { await browser.close(); }
+}, 15_000);
+
+test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("Think preserves both plugin pill formats and rejects plugin replacement", async () => {
+  const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
+  try {
+    const page = await browser.newPage();
+    for (const { markup, identity, replacement } of [
+      { markup: '<span data-id="plugin:fixture" data-keyword="Codex Native2" contenteditable="false">Codex Native2</span>',
+        identity: "data-id", replacement: "plugin:other" },
+      // Captured from the Free account composer on 2026-10-14. The display name
+      // is visible text but belongs to the plugin, not to the user's prompt.
+      { markup: '<span app-mention-path="app://fixture" app-mention-display-name="Clew review" contenteditable="false"><span>Clew review</span></span>',
+        identity: "app-mention-path", replacement: "app://other" },
+    ]) {
+      await page.setContent(`<form><div role="textbox" contenteditable="true"><p>${markup} </p></div>
+        <button type="button" aria-pressed="false">Think</button></form>
+        <script>document.querySelector('button').onclick = event => {
+          event.currentTarget.setAttribute('aria-pressed', String(event.currentTarget.getAttribute('aria-pressed') !== 'true'));
+        };</script>`);
+      const composer = page.getByRole("textbox");
+      const original = await composer.innerHTML();
+      await setChatGptThinkMode(composer, true);
+      expect(await page.getByRole("button", { name: "Think", exact: true }).getAttribute("aria-pressed")).toBe("true");
+      expect(await composer.innerHTML()).toBe(original);
+      await setChatGptThinkMode(composer, false);
+      await page.getByRole("button", { name: "Think", exact: true }).evaluate((element, change) => {
+        element.addEventListener("click", () => {
+          document.querySelector(`[${change.identity}]`)!.setAttribute(change.identity, change.replacement);
+        });
+      }, { identity, replacement });
+      // The name is unchanged: replacing the actual plugin must still fail.
+      const failure = await setChatGptThinkMode(composer, true).then(() => undefined, error => error);
+      expect(failure).toBeInstanceOf(Error);
+      expect(failure.message).toContain("did not preserve the empty draft and selected connectors");
+    }
   } finally { await browser.close(); }
 }, 15_000);
 
@@ -134,7 +171,7 @@ test.skipIf(!process.env.LAUNCHER_TEST_ELECTRON)("captured Think toggles indepen
   });
   try {
     const page = await app.firstWindow();
-    for (const fixture of ["chatgpt-composer-think.html", "chatgpt-composer-think-2026-10-11.html"]) {
+    for (const fixture of ["chatgpt-composer-think.html", "chatgpt-composer-think-2026-10-11.html", "chatgpt-composer-think-2026-10-28.html"]) {
       const captured = readFileSync(new URL(`./fixtures/${fixture}`, import.meta.url), "utf8");
       for (const label of ["Think", "思考", "Думать", "생각하기", "التفكير", "Unknown future translation"]) {
         await page.setContent(`<form data-chatgpt-composer><div id="prompt-textarea" contenteditable="true"><span data-id="plugin:fixture" data-keyword="Codex Native2" contenteditable="false">Codex Native2</span></div>

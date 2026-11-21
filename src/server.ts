@@ -14,6 +14,7 @@ import {
   extractChatGptTurnIdentity,
   extractCodexTurnIdentityFromBody,
   extractChatGptCompactionSourceRevision,
+  findChatGptCompactionSourceRevision,
   isCodexComposerPrediction,
 } from "./adapters/chatgpt-web/environment";
 import { assertComposerPredictionFits, configureComposerPrediction } from "./composer-predictions";
@@ -747,11 +748,15 @@ export async function responseRequest(
     const body = parsed._rawBody as { input?: unknown[] };
     // v1 installs the bounded user-message output, whereas v2 retains the original source.
     // Authenticate both exact producer-defined representations, never arbitrary rewrites.
-    const v1Source = extractChatGptCompactionSourceRevision({
+    // Inspect the literal retained representation: an unchanged summary can match the
+    // previous checkpoint, but must not substitute its recovered delegation here.
+    // A child can have only parent instructions and contextual user items. Use the canonical
+    // instruction classifier: retained user-role content need not contain a human source.
+    const v1Source = findChatGptCompactionSourceRevision({
       ...parsed,
       _rawBody: { ...body, input: buildCompactV1Output(extractCompactUserMessages(body.input), summary) },
-    });
-    rememberCompactionContinuation(parsed, identity, [source, v1Source], summary);
+    }, { recoverCheckpoint: false });
+    rememberCompactionContinuation(parsed, identity, v1Source ? [source, v1Source] : [source], summary);
   };
   if (compaction && route.backendModel === CHATGPT_WEB_LUNA_BACKEND_MODEL && !config.experimentalBiggerContext) {
     return formatErrorResponse(

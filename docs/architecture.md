@@ -97,6 +97,12 @@ label does not itself replace a remote connector's cached schema; legacy connect
 
 ## Browser lifecycle
 
+ChatGPT DOM contracts live in [`src/chatgpt-ui`](../src/chatgpt-ui/README.md), grouped
+by composer, model picker and turn renderer. Each component records its historical
+evidence and regression coverage. Model policy and turn ownership remain outside
+that layer. Diagnostic checkpoints identify observed structural variants without
+copying message content; a variant's age never selects or retires it automatically.
+
 The desktop launcher owns one persistent Electron partition and up to five task-bound browser
 tabs. Each task/model/effort/compaction epoch owns one exact `WebContentsView` lease; sequential
 native messages reuse that surface, while each message receives a fresh turn-bound MCP token and
@@ -117,7 +123,7 @@ logical identities fail explicitly; accepted messages are never resent to repair
 Sign-in uses that same persistent Electron partition. ChatGPT login pages and allowed identity-
 provider popups are adopted into a temporary `WebContentsView` inside the launcher instead of being
 redirected to another browser. After the provider returns to ChatGPT, the launcher requires both a
-server-authenticated session and the Temporary Chat composer in the primary owned view, then closes
+server-authenticated session and a new ordinary chat composer in the primary owned view, then closes
 the temporary auth view. There is no browser-profile handoff, cookie import, CDP login port, or
 temporary session-transfer directory.
 
@@ -150,13 +156,16 @@ Top-level `model_context_window` raises only the proxied native rows' advertised
 Codex to apply its own configured context override without clamping. Routed ChatGPT Web models
 retain their measured adapter-owned limits.
 
-**Save chats in ChatGPT** (`setup --saved-chats`; `--temporary-chats` restores the default)
-uses ordinary saved conversations for task turns in Automatic and Zero Risk modes. This is
-independent of conversation reuse. Changing it releases idle retained tabs, and its provider
-configuration participates in conversation identity. Saved history does not authorize reopening
-an arbitrary ChatGPT conversation. Compaction still starts the next context epoch in a new chat;
-account inspection continues to use an empty Temporary Chat. ChatGPT memory and custom instructions
-may apply to saved conversations.
+Automatic and Zero Risk task turns use Temporary Chat by default. The `useTemporaryChats`
+preference (`setup --temporary-chats`; `--ordinary-chats` to disable) selects the mode for task
+turns, connector verification and smoke tests. Sign-in and account
+inspection still use ordinary chats. The old `useSavedChats` preference is discarded and cannot
+override the new setting. An absent new setting defaults to true; an explicit false is preserved.
+Changing modes retires idle retained task surfaces after setup succeeds;
+the launcher refuses to change it during active browser work. This is independent of conversation
+reuse. Saved history does not authorize reopening an arbitrary ChatGPT conversation. Compaction
+still starts the next context epoch in a new chat. ChatGPT memory and custom instructions may apply
+in either mode.
 
 Automatic mode also offers an explicit **New browser chat for each turn** setting, disabled by
 default (`setup --fresh-conversation`; `--retained-conversation` restores reuse). Each native turn
@@ -170,9 +179,9 @@ Bigger Context partitions complete ordered records against each message's availa
 composer budgets. Inert stages carry text; the final message also carries all retained attachments,
 the execution contract and any output schema. Their reserves are deducted before partitioning,
 then preflight checks the actual compiled messages and total transaction. The selected execution
-effort and attachment references remain unchanged. Large transactions use up to six messages;
-the advertised context and compaction thresholds remain three times the base limits. More parts
-reduce message size, not the amount of history retained.
+effort and attachment references remain unchanged. A request that fits inline uses one message. Larger requests use two or six
+messages within the model family’s total context limit. The model catalog sets the threshold
+for automatic compaction separately.
 
 In Full mode, routed compaction v1/v2 uses the exact retained source agent and a one-shot MCP control
 capability that accepts only the bound checkpoint; it cannot claim or invoke the ordinary Codex tool
@@ -277,6 +286,15 @@ unexpected child exit is recovered with a bounded restart budget; a crash loop b
 launcher error.
 
 ## Security invariants
+
+Native task recovery normally uses the bridge's own `CODEX_HOME`. An operator can register up to
+seven additional local homes through `CODEX_CHATGPT_WEB_TRUSTED_CODEX_HOMES`, a JSON array of absolute
+existing directories. Request data cannot register homes. Directory aliases are canonicalized;
+the resolver establishes one owning home before reading the current turn's permissions and rejects
+duplicate thread ownership. Each secondary home uses its own `sqlite_home` configuration, without
+inheriting the primary process's SQLite override. With multiple homes, every turn needs current
+native proof and the legacy single-home environment cache is neither read nor written. DEV profile
+activation removes the production registration. See [setup details](../TROUBLESHOOTING.md#a-second-codex_home-fails-with-missing-network-access-in-trusted-codex-environment-context).
 
 - Bind the Responses proxy and health endpoint to loopback only.
 - Store browser state and tunnel credentials under the application home with mode `0600`.

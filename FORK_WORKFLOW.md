@@ -11,23 +11,31 @@ Last updated 21 November 2026.
 
 ## Where the current work is
 
-**`main` is not the installed build.** It is the fork's index and the last
-merge-based integration (upstream 6.1.8). The build that is actually installed
-lives on the newest `codex/local-provider-<version>` branch.
+**`main` is the source of the build installed locally**: upstream `v6.1.19`
+plus the local patch set below. Work happens on `main`.
+
+Installed builds are tagged `local-build/<version>-r<n>`. A tag names the exact
+commit whose runtime is running. `main` can be ahead of the newest tag when
+fixes are committed but not installed yet. `LOCAL_PROVIDER_REPAIR.md` says
+which, with the hashes and the rollback bundle of each build.
 
 | Branch | Based on | Status | What it holds |
 | --- | --- | --- | --- |
-| `codex/local-provider-6.1.19` | upstream `v6.1.19` | **Installed** (since 20 Nov 2026, runtime rebuilt 21 Nov) | Local provider coexistence, review-required updater, current-turn calendar preamble, rebuilt preamble after mid-turn compaction. Record: `LOCAL_PROVIDER_REPAIR.md` on that branch. |
+| `main` | upstream `v6.1.19` | **Current** | The installed build's source, this file and the fork banner in the README. |
+| `codex/local-provider-6.1.19` | upstream `v6.1.19` | Merged into `main` on 21 Nov 2026 | The 6.1.19 port and its fixes up to the merge. |
 | `codex/local-provider-6.1.18` | upstream `v6.1.18` | Superseded | Local provider coexistence, calendar preamble, passkey storage bounds (upstream since 6.1.19). |
 | `codex/local-provider-6.1.17` | upstream `v6.1.17` | Superseded | First port of the provider and external-catalogue changes onto an upstream release tag. One snapshot commit of what was installed on 2 Nov 2026. |
-| `main` | upstream 6.1.8 merge | Historical integration | Upstream 6.1.8 merged with the fork's catalogue evidence and turn-retirement messages. This file. |
 | `codex/external-catalog-5.0.8` | upstream `v5.0.8` | Historical | First prototype of the external catalogue checks. One snapshot commit. |
-| `codex/passkey-login-integration` | upstream 5.0.4 | Historical, merged into `main` | Passkey sign-in, catalogue routing, hook recovery. |
+| `codex/passkey-login-integration` | upstream 5.0.4 | Historical, in `main`'s history | Passkey sign-in, catalogue routing, hook recovery. |
 | `codex/tunnel-health-rediscovery` | upstream 5.0.4 | Closed upstream PR #354 | Tunnel health rediscovery. |
 | `codex/viewport-retry-classification` | upstream 5.0.4 | Closed upstream PR #355 | Viewport retry classification. |
 | `codex/runtime-reliability-review` | upstream 5.0.4 | Historical | The two fixes above on one review branch. |
 | `passkey-login-supersede` | upstream 5.0.1 | Historical. Do not force-push | Original passkey supersede work. Its pre-rebase state is `backup/passkey-login-supersede-prerebase`. |
 | `backup/pre-6.1.8-20261013` | upstream 5.0.4 | Backup | Fork `main` before the 6.1.8 merge. |
+
+Until 21 November 2026 `main` stopped at the 6.1.8 integration and the
+installed build lived only on a per-release branch. That 6.1.8 state is commit
+`e2d4e4b` in `main`'s history.
 
 ## The local patch set
 
@@ -37,16 +45,26 @@ upstream first: a fix that has landed upstream is dropped, not carried.
 | Fix | Since | Upstream |
 | --- | --- | --- |
 | Accept the existing `local_model_bridge` provider when its URL is exactly `http://127.0.0.1:48111/v1` and its absolute catalogue lists visible `chatgpt-web-*` models | 6.1.8 | Not upstream, local by design |
-| Recognise an external catalogue without claiming a restart or a verified native request | 6.1.8 | Not upstream, local by design |
+| Recognise an external catalogue without claiming a restart or a verified native request. Only visible rows count | 6.1.8, visible rows 21 Nov 2026 | Not upstream, local by design |
 | Updater shows new upstream versions as needing a compatibility review and refuses direct installation | 6.1.18 | Not upstream, local by design |
 | Authenticate the current-turn date/timezone preamble against its native rollout record | 6.1.18 | Open issue #1004 |
-| Authenticate the preamble Codex rebuilds in a mid-turn compaction | 6.1.19 (21 Nov 2026) | Not reported yet |
+| Authenticate the preamble Codex rebuilds in a mid-turn compaction, without letting it change the turn's environment | 6.1.19 (21 Nov 2026) | Not reported yet |
+| Read large rollouts once per record, parse only records that can matter, 64 MiB record bound | 6.1.19 (21 Nov 2026) | Not reported yet |
+| Name why a turn ended: turn retirement, client disconnect, and the real reason behind "ChatGPT stopped responding" | 6.1.8, dropped 6.1.17 to 6.1.19, restored 21 Nov 2026 | Not upstream |
 | Passkey session import accepts browser-valid local storage with aggregate bounds | 6.1.18 | Fixed in 6.1.19 (issue #991), dropped |
+
+When porting, diff the previous build against its upstream tag and account for
+every file. The turn diagnostics were lost for three versions because the port
+to 6.1.17 started from a new branch and nothing listed what the old one held:
+
+```sh
+git diff --stat v<previous> local-build/<previous>-r<n>
+```
 
 ## One checkout
 
-There is one working copy: `~/Developer/codex-chatgpt-web`, checked out on the
-installed branch. Remotes: `origin` is this fork, `upstream` is
+There is one working copy: `~/Developer/codex-chatgpt-web`, checked out on
+`main`. Remotes: `origin` is this fork, `upstream` is
 `miuuyy/codex-chatgpt-web`. `remote.pushDefault` is `origin`.
 
 Do not create sibling folders per version. They were consolidated on
@@ -54,23 +72,24 @@ Do not create sibling folders per version. They were consolidated on
 
 | Old folder | Now |
 | --- | --- |
-| `codex-chatgpt-web` (on `main`) | The one checkout, switched to the installed branch |
-| `codex-chatgpt-web-local-provider-6.1.19` | Branch `codex/local-provider-6.1.19`, checked out in the one checkout |
+| `codex-chatgpt-web` (on the 6.1.8 `main`) | The one checkout, on the current `main` |
+| `codex-chatgpt-web-local-provider-6.1.19` | Branch `codex/local-provider-6.1.19`, merged into `main` |
 | `codex-chatgpt-web-local-provider-6.1.18` | Branch `codex/local-provider-6.1.18` |
 | `codex-chatgpt-web-local-provider-6.1.17` | Branch `codex/local-provider-6.1.17` (uncommitted work recorded as a snapshot commit) |
 | `codex-chatgpt-web-coexistence` | Branch `codex/external-catalog-5.0.8` (uncommitted work recorded as a snapshot commit) |
 
-When a second tree is needed, for example to compare against the previous
-version, add a temporary worktree inside the checkout and remove it afterwards:
+When a second tree is needed, for example to port onto a new upstream tag or to
+compare with the previous version, add a temporary worktree inside the checkout
+and remove it afterwards:
 
 ```sh
 git worktree add .worktrees/<name> <branch>
 git worktree remove .worktrees/<name>
 ```
 
-`.worktrees/` and `repair-evidence/` are ignored through `.git/info/exclude`.
-Do not put a test worktree under `/tmp`: the runtime's durable-path guard fails
-there.
+`.worktrees/`, `repair-evidence/` and stray `node_modules` links are ignored
+through `.git/info/exclude`. Do not put a test worktree under `/tmp`: the
+runtime's durable-path guard fails there.
 
 ## Private evidence stays local
 
@@ -83,25 +102,51 @@ is public.
 
 1. `git fetch upstream --tags`, then read the upstream changes since the
    installed tag. Decide which rows of the patch set are still needed.
-2. `git switch -c codex/local-provider-<new> v<new>` in the one checkout.
-3. Cherry-pick the still-needed commits from the previous
-   `codex/local-provider-*` branch and resolve against the new source.
+2. `git worktree add -b codex/local-provider-<new> .worktrees/<new> v<new>`.
+3. Port the still-needed fixes from `main` and resolve against the new source.
+   Account for every file in `git diff --stat v<previous> main`.
 4. `bun install --frozen-lockfile` at the root and in `launcher/`.
-5. Run the runtime tests (`bun test ./tests`), the launcher tests, and both
-   type checks.
+5. Run the runtime tests (`bun test ./tests`), the launcher tests
+   (`node --test tests/*.test.cjs` in `launcher/`), and both type checks.
 6. Build the runtime with the exact Bun pinned in `package.json`
    (`packageManager`). A different Bun version is rejected by the build script.
+   The installed app embeds that Bun at
+   `Contents/Resources/runtime/runtime/bun`.
 7. Package, run `scripts/smoke-local-package.py` and
    `scripts/smoke-local-provider.ts`, then activate with the drain, quit, swap
-   and verify script kept in `repair-evidence/`.
-8. Write `LOCAL_PROVIDER_REPAIR.md` on the new branch, push the branch, and
-   update the two tables above on `main`.
+   and verify script kept in `repair-evidence/`. The launcher must be idle.
+8. Write the new build into `LOCAL_PROVIDER_REPAIR.md`, tag the commit
+   `local-build/<new>-r1` and push the branch and the tag.
+9. Merge into `main` so that `main` holds exactly the new branch plus this file
+   and the README banner, then remove the worktree:
+
+   ```sh
+   git switch main
+   git merge --no-commit --no-ff -s ours codex/local-provider-<new>
+   git read-tree -u --reset codex/local-provider-<new>
+   git checkout ORIG_HEAD -- FORK_WORKFLOW.md   # then re-add the README banner
+   git commit
+   ```
+
+A runtime-only fix on the installed version does not need a full package. Build
+the runtime, replace `Contents/Resources/runtime` in a copy of the installed
+app, re-sign it ad hoc and activate it. A change under `launcher/` does need a
+full package, because the ASAR changes.
 
 Publishing to this fork is fine. Opening an upstream pull request or issue
 needs the owner's explicit confirmation each time. Never push `v*` tags here:
 the release workflow is tag-triggered.
 
 ## History
+
+### 21 November 2026: consolidation, audit and merge
+
+The per-version folders were reduced to one checkout. A stall after every
+mid-turn compaction was fixed in two builds (`local-build/6.1.19-r2`, `-r3`).
+An audit of the whole patch set followed: see `LOCAL_PROVIDER_REPAIR.md`.
+`codex/local-provider-6.1.19` was then merged into `main` with the branch's
+exact tree, so `main` is the installed build's source again. Nothing was
+force-pushed.
 
 ### 6 September 2026: fork setup and integration rationale
 

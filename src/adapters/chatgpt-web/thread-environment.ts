@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, renameSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import { atomicWriteFile } from "../../config";
-import { getCodexHome } from "../../codex-integration-shared";
+import { getCodexHome, getTrustedCodexHomes } from "../../codex-integration-shared";
 import type { CodexParsedRequest } from "../../types";
 import {
   extractChatGptTurnEnvironmentClaim,
@@ -13,15 +13,18 @@ import {
   extractChatGptRootThreadMetadata,
   hasCurrentChatGptEnvironmentContext,
   extractChatGptCalendarEnvironmentDelta,
+  extractChatGptNativeCompactionEnvironment,
+  extractChatGptRebuiltPreambleClaim,
   hasRawChatGptEnvironmentContext,
   unattributedChatGptEnvironmentMessages,
+  currentChatGptCalendarPreamble,
   isChatGptCompactionContinuation,
   MissingTrustedCodexEnvironmentError,
   type ChatGptEnvironmentClaim,
   type ChatGptSandboxPolicy,
   type ChatGptTurnEnvironment,
 } from "./environment";
-import { resolveCurrentCodexRolloutEnvironment } from "./codex-rollout-environment";
+import { latestCodexRolloutFilesystem, resolveCurrentCodexRolloutEnvironment } from "./codex-rollout-environment";
 import { ChatGptWebAdapterError } from "./adapter-error";
 
 interface StoredThreadEnvironment {
@@ -106,12 +109,15 @@ function validateStoredEnvironment(value: unknown): StoredThreadEnvironment {
   const writableRoots = Array.isArray(parsed.writableRoots) && parsed.writableRoots.length === 0
     ? []
     : absolutePaths(parsed.writableRoots, "writable roots");
-  if (!roots.some(root => contains(root, cwd))) throw new Error("Persisted ChatGPT cwd is outside its roots");
+  const policy = sandboxPolicy(parsed.sandboxPolicy, roots, writableRoots);
+  if (!roots.some(root => contains(root, cwd)) && policy.type !== "dangerFullAccess") {
+    throw new Error("Persisted ChatGPT cwd is outside its roots");
+  }
   return {
     cwd,
     roots,
     writableRoots,
-    sandboxPolicy: sandboxPolicy(parsed.sandboxPolicy, roots, writableRoots),
+    sandboxPolicy: policy,
     updatedAt: parsed.updatedAt,
   };
 }
@@ -126,24 +132,31 @@ function authority(environment: ChatGptTurnEnvironment, updatedAt: number): Stor
   };
 }
 
-function sameAuthority(claim: ChatGptEnvironmentClaim, right: ChatGptTurnEnvironment, allowAdditionalWritableRoots = false): boolean {
+function conflictingAuthorityFields(claim: ChatGptEnvironmentClaim, right: ChatGptTurnEnvironment): string[] {
   const left = claim.environment;
-  const samePaths = (a: string[], b: string[]): boolean => {
-    const expected = new Set(b.map(pathIdentity));
-    return a.length === expected.size && a.every(path => expected.has(pathIdentity(path)));
-  };
-  return pathIdentity(left.cwd) === pathIdentity(right.cwd)
-    && samePaths(left.roots, right.roots)
-    // Filesystem envelopes can omit Codex's extra output directories. The current
-    // native rollout remains the authority returned to the caller, never the claim.
-    && (allowAdditionalWritableRoots
-      ? left.writableRoots.every(path => right.writableRoots.some(root => pathIdentity(root) === pathIdentity(path)))
-      : samePaths(left.writableRoots, right.writableRoots))
-    && left.sandboxPolicy.type === right.sandboxPolicy.type
-    // An envelope that does not state its network policy cannot contradict the rollout on it.
-    && (left.sandboxPolicy.type === "dangerFullAccess" || !claim.statesNetworkAccess
-      || (right.sandboxPolicy.type !== "dangerFullAccess"
-        && left.sandboxPolicy.networkAccess === right.sandboxPolicy.networkAccess));
+  const claimedRoots = new Set(left.roots.map(pathIdentity));
+  const nativeRoots = new Set(right.roots.map(pathIdentity));
+  const nativeGrants = new Set([...right.roots, ...right.writableRoots].map(pathIdentity));
+  const fields: string[] = [];
+  if ((left.cwd !== undefined && pathIdentity(left.cwd) !== pathIdentity(right.cwd))
+    || (right.sandboxPolicy.type !== "dangerFullAccess" && !left.roots.some(root => contains(root, right.cwd)))) fields.push("cwd");
+  // Codex 0.163 omits workspace_roots in some rollouts while its envelope still
+  // lists output directories. Every extra claimed root must be an exact native
+  // grant, and no native workspace may disappear. Return only native authority.
+  if ([...nativeRoots].some(root => !claimedRoots.has(root))
+    || [...claimedRoots].some(root => !nativeGrants.has(root))) fields.push("workspace_roots");
+  // Filesystem envelopes omit Codex's extra output directories, including after
+  // compaction. Only the current native rollout supplies the returned grants.
+  if (!left.writableRoots.every(path => right.writableRoots.some(root => pathIdentity(root) === pathIdentity(path)))) {
+    fields.push("writable_roots");
+  }
+  if (left.sandboxPolicy.type !== right.sandboxPolicy.type) fields.push("sandbox_policy");
+  // An envelope that does not state its network policy cannot contradict the rollout on it.
+  if (left.sandboxPolicy.type !== "dangerFullAccess" && right.sandboxPolicy.type !== "dangerFullAccess"
+    && claim.statesNetworkAccess && left.sandboxPolicy.networkAccess !== right.sandboxPolicy.networkAccess) {
+    fields.push("network_access");
+  }
+  return fields;
 }
 
 /**
@@ -154,13 +167,17 @@ function sameAuthority(claim: ChatGptEnvironmentClaim, right: ChatGptTurnEnviron
 export class ChatGptThreadEnvironmentStore {
   private loaded = false;
   private readonly threads = new Map<string, StoredThreadEnvironment>();
+  private readonly codexHomes: readonly string[];
 
   constructor(
     private readonly path?: string,
     private readonly now: () => number = Date.now,
-    private readonly codexHome: string = getCodexHome(),
+    codexHome: string = getCodexHome(),
     private readonly sqliteHome?: string,
-  ) {}
+    additionalCodexHomes?: readonly string[],
+  ) {
+    this.codexHomes = getTrustedCodexHomes(codexHome, additionalCodexHomes);
+  }
 
   resolve(parsed: CodexParsedRequest): ChatGptTurnEnvironment {
     const identity = extractChatGptTurnIdentity(parsed);
@@ -168,14 +185,26 @@ export class ChatGptThreadEnvironmentStore {
     try {
       const claim = extractChatGptTurnEnvironmentClaim(parsed);
       const environment = claim.environment;
-      if (environment.sandboxPolicy.type !== "dangerFullAccess" && !claim.statesNetworkAccess) {
+      const outsideProjectRoots = environment.cwd !== undefined
+        && !environment.roots.some(root => contains(root, environment.cwd!));
+      if (environment.cwd === undefined || outsideProjectRoots || this.codexHomes.length > 1
+        || (environment.sandboxPolicy.type !== "dangerFullAccess" && !claim.statesNetworkAccess)) {
+        // A shared bridge must prove the current native owner even for complete envelopes.
         // Modern envelopes state filesystem access only. Resolve the current native policy on
         // the first round too: absence of a network statement is not a disabled-network grant.
+        // Likewise, workspace roots do not identify cwd; only this turn's native record can.
+        // Full Access can place a worktree outside those project roots. Authenticate
+        // both the explicit cwd and retained project roots before accepting that shape.
         initialClaim = claim;
-        throw new MissingTrustedCodexEnvironmentError("network access");
+        throw new MissingTrustedCodexEnvironmentError(
+          environment.cwd === undefined ? "cwd"
+            : outsideProjectRoots ? "current native worktree authority"
+            : this.codexHomes.length > 1 ? "current native task ownership" : "network access",
+        );
       }
-      if (identity.threadId) this.set(identity.threadId, environment);
-      return environment;
+      const completeEnvironment = { ...environment, cwd: environment.cwd };
+      if (identity.threadId) this.set(identity.threadId, completeEnvironment);
+      return completeEnvironment;
     } catch (error) {
       if (!(error instanceof MissingTrustedCodexEnvironmentError) || !identity.threadId) throw error;
       const hasCurrentContext = hasCurrentChatGptEnvironmentContext(parsed);
@@ -184,45 +213,117 @@ export class ChatGptThreadEnvironmentStore {
       // Root tasks also retain unattributed environment fragments after compaction.
       // They are historical only when the exact native record predates this task;
       // neither the fragment nor the cache supplies the current authority.
-      const historicalMessages = hasCurrentContext && !currentCompaction
-        ? unattributedChatGptEnvironmentMessages(parsed) : undefined;
+      const calendarPreamble = hasCurrentContext && !currentCompaction && !initialClaim
+        ? currentChatGptCalendarPreamble(parsed) : undefined;
+      const historicalMessages = hasCurrentContext && !currentCompaction && !initialClaim
+        ? unattributedChatGptEnvironmentMessages(parsed, calendarPreamble?.id) : undefined;
       const steeringClaim = hasCurrentContext && !currentCompaction
         ? extractChatGptSteeringEnvironmentClaim(parsed) : undefined;
       const calendarDelta = hasCurrentContext && !currentCompaction
         ? extractChatGptCalendarEnvironmentDelta(parsed) : undefined;
-      if (hasCurrentContext && !currentCompaction && !initialClaim && !historicalMessages && !steeringClaim && !calendarDelta) throw error;
-      const currentClaim = initialClaim ?? (currentCompaction ? extractChatGptContinuationEnvironmentClaim(parsed) : steeringClaim);
+      const nativeCompaction = hasCurrentContext && !currentCompaction && !initialClaim && !steeringClaim && !calendarDelta
+        ? extractChatGptNativeCompactionEnvironment(parsed) : undefined;
+      if (hasCurrentContext && !currentCompaction && !initialClaim && !historicalMessages?.length && !calendarPreamble && !steeringClaim && !calendarDelta && !nativeCompaction) {
+        console.warn("[chatgpt-web] trusted_environment_recovery rejected=unrecognized_current_context");
+        throw error;
+      }
+      const currentClaim = initialClaim ?? (currentCompaction
+        ? extractChatGptContinuationEnvironmentClaim(parsed) : steeringClaim ?? nativeCompaction?.claim);
+      const resolvedCalendarDelta = calendarDelta ?? currentClaim?.calendarDelta;
       const rolloutIdentity = lineage ?? extractChatGptRootThreadMetadata(parsed);
       // Automatic compaction has a current turn_context; standalone compaction has only its
       // source turn_context. Either must be the latest native record, never an arbitrary ancestor.
       const compactionSourceTurnId = parsed._compactionRequest
         ? extractChatGptCompactionSourceRevision(parsed).turnId : undefined;
       if (rolloutIdentity && identity.turnId) {
-        const rolloutEnvironment = resolveCurrentCodexRolloutEnvironment({
-          codexHome: this.codexHome,
+        const rollout = resolveCurrentCodexRolloutEnvironment({
+          codexHome: this.codexHomes[0]!,
+          additionalCodexHomes: this.codexHomes.slice(1),
           ...(this.sqliteHome ? { sqliteHome: this.sqliteHome } : {}),
           lineage: rolloutIdentity,
           turnId: identity.turnId,
           ...(compactionSourceTurnId ? { compactionSourceTurnId } : {}),
-          ...(historicalMessages ? { historicalEnvironmentMessages: historicalMessages } : {}),
+          ...(historicalMessages?.length ? { historicalEnvironmentMessages: historicalMessages } : {}),
+          ...(calendarPreamble ? { currentCalendarPreamble: calendarPreamble } : {}),
+          ...(nativeCompaction ? { compactedEnvironmentItems: nativeCompaction.items } : {}),
           tools: parsed.context.tools,
         });
-        if (rolloutEnvironment) {
-          if (calendarDelta) {
+        if (rollout) {
+          let rolloutEnvironment = rollout.environment;
+          // A preamble rebuilt by this task's own compaction is a current claim too. Its origin
+          // is proven by the native replacement history; its content gets the same comparison.
+          // The extractors make a rebuilt preamble and another current claim mutually exclusive.
+          // Fail closed if that ever stops holding rather than leave one of them uncompared.
+          if (currentClaim && rollout.rebuiltPreambleMessages) {
+            throw new Error("Compaction continuation requires one current native environment claim");
+          }
+          const rebuiltClaim = rollout.rebuiltPreambleMessages
+            ? extractChatGptRebuiltPreambleClaim(parsed, rollout.rebuiltPreambleMessages) : undefined;
+          const claim = currentClaim ?? rebuiltClaim;
+          let verifiedClaim = claim;
+          // Full Access roots describe workspace context, not a permission boundary.
+          // Codex can add output directories after compaction (#933), or omit native
+          // roots after a restart (#847). Keep every declared native project; the
+          // exact current rollout still owns cwd, permissions and task identity.
+          if (rolloutEnvironment.sandboxPolicy.type === "dangerFullAccess"
+            && claim?.environment.sandboxPolicy.type === "dangerFullAccess"
+            && (claim.environment.cwd === undefined
+              || pathIdentity(claim.environment.cwd) === pathIdentity(rolloutEnvironment.cwd))) {
             const nativeRoots = new Set(rolloutEnvironment.roots.map(pathIdentity));
-            if (rolloutEnvironment.sandboxPolicy.type !== "dangerFullAccess"
-              || calendarDelta.workspaceRoots.some(roots => roots.length !== nativeRoots.size
+            const claimedRoots = new Set(claim.environment.roots.map(pathIdentity));
+            const accepted = claim.environment.roots.some(root => contains(root, rolloutEnvironment.cwd))
+              && (!rollout.workspaceRootsDeclared || [...nativeRoots].every(root => claimedRoots.has(root)));
+            // A later Desktop turn can have fewer roots than its session started with, even
+            // none containing cwd (#939, #945). That is no conflict when Codex itself recorded
+            // exactly this filesystem as current. Those start projects remain workspace context.
+            const recorded = !accepted && claim.filesystemXml !== undefined
+              && claim.filesystemXml === latestCodexRolloutFilesystem(rollout.rolloutPath);
+            if (accepted || recorded) {
+              const roots = rollout.workspaceRootsDeclared
+                ? [...rolloutEnvironment.roots, ...claim.environment.roots.filter(root => !nativeRoots.has(pathIdentity(root)))]
+                : [...claim.environment.roots];
+              rolloutEnvironment = { ...rolloutEnvironment, roots, writableRoots: [...roots] };
+              if (recorded) {
+                verifiedClaim = { ...claim, environment: { ...claim.environment, roots, writableRoots: roots } };
+              }
+            }
+          }
+          if (resolvedCalendarDelta) {
+            const nativeRoots = new Set(rolloutEnvironment.roots.map(pathIdentity));
+            if (resolvedCalendarDelta.filesystemProfiles.some(profile => profile !== rollout.filesystemProfileXml)
+              || resolvedCalendarDelta.workspaceRoots.some(roots => roots.length !== nativeRoots.size
                 || roots.some(root => !nativeRoots.has(root)))) {
               throw new Error("Calendar environment delta conflicts with its current Codex rollout");
             }
           }
-          if (currentClaim && !sameAuthority(currentClaim, rolloutEnvironment, initialClaim !== undefined || steeringClaim !== undefined)) {
-            const source = currentCompaction ? "Compaction continuation" : initialClaim ? "Current" : "Steering";
-            throw new Error(`${source} environment conflicts with its current Codex rollout`);
+          const conflicts = verifiedClaim ? conflictingAuthorityFields(verifiedClaim, rolloutEnvironment) : [];
+          if (conflicts.length > 0) {
+            const source = currentCompaction || nativeCompaction || rebuiltClaim ? "Compaction continuation" : initialClaim ? "Current" : "Steering";
+            // Field names are safe to export; paths, request text and permission
+            // contents are deliberately excluded from both the log and UI error.
+            console.warn(`[chatgpt-web] trusted environment conflict (source=${source}, fields=${conflicts.join(",")})`);
+            throw new Error(`${source} environment conflicts with its current Codex rollout (fields: ${conflicts.join(", ")})`);
           }
-          this.set(rolloutIdentity.threadId, rolloutEnvironment);
-          return rolloutEnvironment;
+          // A rebuilt preamble has no wire provenance. As soon as the model has answered, the
+          // same request shape stops reading as a current update and resolves from the rollout
+          // alone, so the preamble's extra roots must not shape this round either: the broker
+          // refuses a tool loop whose environment differs between rounds. The comparison above
+          // still rejects a preamble that contradicts the native authority.
+          const resolvedEnvironment = rebuiltClaim ? rollout.environment : rolloutEnvironment;
+          this.set(rolloutIdentity.threadId, resolvedEnvironment);
+          return resolvedEnvironment;
         }
+      }
+      console.warn(`[chatgpt-web] trusted_environment_recovery ${JSON.stringify({
+        currentContext: hasCurrentContext,
+        compactionContinuation: currentCompaction,
+        nativeMetadata: rolloutIdentity !== undefined,
+        nativeTurnId: identity.turnId !== undefined,
+        registeredHomes: this.codexHomes.length,
+        nativeRolloutFound: false,
+      })}`);
+      if (this.codexHomes.length > 1) {
+        throw new Error("No current native Codex task proof in the trusted homes", { cause: error });
       }
       // Only a current native rollout can supersede an unrecognized historical envelope. Without
       // that proof, do not turn arbitrary history or an invalid update into cached authority.
@@ -275,6 +376,8 @@ export class ChatGptThreadEnvironmentStore {
   }
 
   private set(threadId: string, environment: ChatGptTurnEnvironment): void {
+    // Shared-home recovery uses current native proof, never the single-home cache.
+    if (this.codexHomes.length > 1) return;
     // Only this path has already verified authority from the current request, native
     // rollout, or a successfully loaded parent. A cache read alone may never recover it.
     this.load(true);

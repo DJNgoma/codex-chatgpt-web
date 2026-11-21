@@ -18,6 +18,10 @@ created. Repository contents, tool output, websites, and prompt text are untrust
    and source instruction to its native thread, turn, model and effort. A freshly emitted environment
    claim without a new human message must match that turn's canonical rollout in cwd, roots and
    sandbox policy; the checkpoint alone does not grant filesystem authority.
+   Under native Full Access, a managed worktree may be outside the retained project roots.
+   That case requires the current rollout to authenticate the cwd, unrestricted permissions,
+   and the exact roots recorded in `turn_context` or `session_meta.runtime_workspace_roots`.
+   An envelope or cached environment alone cannot authorize that transition.
 3. It creates a random, turn-scoped token and embeds it in that one ChatGPT browser prompt.
 4. Every Codex Native action presents that same turn token. The MCP handler idempotently claims an
    internal binding plus a request-scoped activity lease and immediately dispatches the requested
@@ -99,22 +103,28 @@ turn; it never chooses another model, starts another transport, or returns a fab
 The launcher keeps ChatGPT login, identity-provider navigation, and model turns in one private
 Electron partition. Allowed login popups are adopted into an in-launcher `WebContentsView` that
 shares that partition; unrelated external links remain outside it. A visible composer alone is not
-authentication evidence: the launcher also requires a valid server session and an exact Temporary
-Chat URL before setup can continue. No cookies, local storage, or browser profile are copied from an
+authentication evidence: the launcher also requires a valid server session and an ordinary new-chat
+URL before setup can continue. No cookies, local storage, or browser profile are copied from an
 external browser.
 
 ### Cross-turn data leakage
 
 Browser turns use at most five independent task-bound tabs in one private login partition. Every
-outer Codex task owns an exact launcher surface lease and retains its Temporary Chat only across
+outer Codex task owns an exact launcher surface lease and retains its ChatGPT conversation only across
 sequential messages in the same model/effort/compaction epoch; chats are never reused across tasks.
 Closing a running tab destroys its page and terminates that turn. The five-tab limit bounds parallel
 account traffic. Tool calls remain in the same ChatGPT response. The
 bounded local continuation cache is private, expires, and exists only to implement Codex
 `previous_response_id` replay. Full-mode context compaction accepts a checkpoint only through its
 one-shot MCP control capability in the exact retained source chat. If that chat no longer exists, a
-fresh tool-free Temporary Chat receives the canonical Codex history; the bridge never parses ordinary
+fresh tool-free chat receives the canonical Codex history; the bridge never parses ordinary
 assistant prose as a structured handoff.
+
+**Temporary Chat** is enabled by default and keeps new task conversations out of ChatGPT history; it does not prevent OpenAI from processing them
+or change local Codex history and diagnostics. ChatGPT memory, plugins and custom instructions may
+still apply. Existing ChatGPT conversations are not deleted. Connector verification follows the
+selected mode; sign-in and account inspection use ordinary chats. The retired saved-chat preference
+is discarded when loading older configuration; an explicit choice to disable Temporary Chat is preserved.
 
 ## Network exposure
 

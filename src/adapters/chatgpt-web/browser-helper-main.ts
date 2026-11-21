@@ -17,10 +17,10 @@ interface RunMessage {
   config: {
     appName: string;
     browserHostDescriptorPath: string;
+    useTemporaryChats?: boolean;
     browserDiagnosticsPath?: string;
     turnTimeoutMs: number;
     autoApproveToolCalls: boolean;
-    useSavedChats?: boolean;
   };
   turn: {
     traceId: string;
@@ -45,6 +45,7 @@ interface VerifyMessage {
   config: {
     appName: string;
     browserHostDescriptorPath: string;
+    useTemporaryChats?: boolean;
   };
 }
 
@@ -196,7 +197,7 @@ async function run(message: RunMessage): Promise<void> {
       browserDiagnosticsPath: message.config.browserDiagnosticsPath,
       turnTimeoutMs: message.config.turnTimeoutMs,
       autoApproveToolCalls: message.config.autoApproveToolCalls,
-      useSavedChats: message.config.useSavedChats === true,
+      useTemporaryChats: message.config.useTemporaryChats !== false,
     },
   };
   const abortController = new AbortController();
@@ -263,8 +264,8 @@ async function run(message: RunMessage): Promise<void> {
     } : {}),
     onHeartbeat: () => writeProtocol({ type: "event", id: message.id, event: "heartbeat" }),
     onGenerationProgress: () => writeProtocol({ type: "event", id: message.id, event: "generation_progress" }),
-    onPreparedSelected: reused => {
-      if (!writeProtocol({ type: "event", id: message.id, event: "prepared_selected", reused })) {
+    onPreparedSelected: (reused, transactionId) => {
+      if (!writeProtocol({ type: "event", id: message.id, event: "prepared_selected", reused, transactionId })) {
         throw new Error("Browser helper could not request prompt selection");
       }
       return promptSelection.wait().then(() => undefined);
@@ -362,13 +363,14 @@ function maintenanceWorker(message: MaintenanceMessage): ChatGptBrowserWorker {
   }
   const appName = message.config.appName?.trim();
   const browserHostDescriptorPath = message.config.browserHostDescriptorPath?.trim();
-  if (!appName || appName.length > 80 || !browserHostDescriptorPath) {
+  if (!appName || appName.length > 80 || !browserHostDescriptorPath
+    || (message.config.useTemporaryChats !== undefined && typeof message.config.useTemporaryChats !== "boolean")) {
     throw new Error("Browser helper maintenance config is invalid");
   }
   const provider: CodexProviderConfig = {
     adapter: "chatgpt-web",
     baseUrl: "https://chatgpt.com",
-    chatgptWeb: { appName, browserHost: "launcher", browserHostDescriptorPath },
+    chatgptWeb: { appName, browserHost: "launcher", browserHostDescriptorPath, useTemporaryChats: message.config.useTemporaryChats !== false },
   };
   return ChatGptBrowserWorker.forProvider(provider);
 }
@@ -380,7 +382,7 @@ async function maintain(message: InspectMessage | SmokeMessage | LimitsMessage):
   try {
     const worker = maintenanceWorker(message);
     const value = message.type === "inspect"
-      ? await worker.inspectSession(message.detectCapabilities)
+      ? await worker.inspectSession(message.detectCapabilities, message.id)
       : message.type === "limits" ? await worker.inspectLimitsPlan()
       : await worker.smokeTest(abortController.signal);
     writeProtocol({ type: "result", id: message.id, value });
