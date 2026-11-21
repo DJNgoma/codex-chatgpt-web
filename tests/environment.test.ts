@@ -2687,6 +2687,8 @@ ${inventory}</environment_context>` }],
   //  7. an ambiguous (repeated id) or non-user native item proves the message
   //  8. a rebuilt item without exactly one complete environment fragment becomes authority
   //  9. the date-only calendar preamble silently gains this compaction route
+  // 10. the rebuilt preamble's roots shape the first round's environment but not the next
+  //     round's, and the broker then refuses the tool loop as a changed environment
   function rebuiltPreambleFixture(environmentText = environmentXml) {
     const fixture = resumedRootFixture();
     const body = fixture.request._rawBody as { client_metadata: Record<string, string>; input: Array<Record<string, unknown>> };
@@ -2745,6 +2747,29 @@ ${inventory}</environment_context>` }],
     write([sessionMeta, taskStarted(), childTurnContext(), taskStarted("01a06c66-ffff-75c6-a0df-318f890ef6de"),
       compacted([native(preamble), native(summary)]), childTurnContext()]);
     expect(() => store.resolve(request)).toThrow("does not authenticate the historical environment messages");
+  });
+
+  test("a rebuilt preamble never changes the environment between rounds of the same turn", () => {
+    const extra = join(dirname(root), "claimed-output");
+    const fixture = rebuiltPreambleFixture(environmentXml.replace("</workspace_roots>", `<root>${extra}</root></workspace_roots>`));
+    const { codexHome, request, body, preamble, summary, native, write, sessionMeta, taskStarted, compacted } = fixture;
+    write([sessionMeta, taskStarted(), compacted([native(preamble), native(summary)]), childTurnContext()]);
+    const store = new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome);
+    const identity = (environment: ReturnType<typeof store.resolve>) => ({
+      cwd: environment.cwd, roots: environment.roots, writableRoots: environment.writableRoots,
+      sandboxPolicy: environment.sandboxPolicy,
+    });
+    // First round after the compaction: the preamble is the newest thing in the request.
+    const first = identity(store.resolve(request));
+    // The model answers with a tool call and Codex returns its result. The same preamble is now
+    // followed by assistant output, so it no longer reads as a current update.
+    body.input.push(
+      { type: "function_call", id: "fc_round_two", call_id: "call_round_two", name: "exec_command", arguments: "{}" },
+      { type: "function_call_output", id: "fco_round_two", call_id: "call_round_two", output: "done" },
+    );
+    expect(identity(new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(request))).toEqual(first);
+    // Only the native turn context supplies the roots, in both rounds.
+    expect(first.roots).toEqual([root]);
   });
 
   test("a rebuilt preamble that contradicts the current turn context is rejected", () => {

@@ -299,8 +299,14 @@ export class ChatGptThreadEnvironmentStore {
             console.warn(`[chatgpt-web] trusted environment conflict (source=${source}, fields=${conflicts.join(",")})`);
             throw new Error(`${source} environment conflicts with its current Codex rollout (fields: ${conflicts.join(", ")})`);
           }
-          this.set(rolloutIdentity.threadId, rolloutEnvironment);
-          return rolloutEnvironment;
+          // A rebuilt preamble has no wire provenance. As soon as the model has answered, the
+          // same request shape stops reading as a current update and resolves from the rollout
+          // alone, so the preamble's extra roots must not shape this round either: the broker
+          // refuses a tool loop whose environment differs between rounds. The comparison above
+          // still rejects a preamble that contradicts the native authority.
+          const resolvedEnvironment = rebuiltClaim ? rollout.environment : rolloutEnvironment;
+          this.set(rolloutIdentity.threadId, resolvedEnvironment);
+          return resolvedEnvironment;
         }
       }
       console.warn(`[chatgpt-web] trusted_environment_recovery ${JSON.stringify({
