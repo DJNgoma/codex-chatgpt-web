@@ -31,6 +31,12 @@ export interface CodexRolloutEnvironment {
   /** Native model-visible projection; never used to grant execution permissions. */
   filesystemProfileXml?: string;
   rolloutPath: string;
+  /**
+   * Unattributed environment messages proven only by this task's latest native compaction.
+   * Codex rebuilt them for the running turn, so they are current claims: the store must still
+   * compare them with this turn's native authority before the task may continue.
+   */
+  rebuiltPreambleMessages?: ChatGptUnattributedEnvironmentMessage[];
 }
 
 const CODEX_ID_SOURCE = "[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
@@ -333,17 +339,41 @@ function verifyCurrentCalendarPreamble(fd: number, size: number, turnId: string,
   throw new Error("Codex rollout does not authenticate the current calendar preamble");
 }
 
+/** One native user message with this id and exactly this content, or no proof at all. */
+function replacementHistoryProves(history: unknown, id: string, content: unknown): boolean {
+  if (!Array.isArray(history)) return false;
+  const matches = history.filter(value => record(value)?.id === id);
+  const match = record(matches[0]);
+  return matches.length === 1 && match?.type === "message" && match.role === "user"
+    && isDeepStrictEqual(match.content, content);
+}
+
+/**
+ * Prove every unattributed environment message against the canonical rollout.
+ *
+ * A message is historical when its exact native record predates this task: an ordinary
+ * response item, or the replacement history of an earlier native compaction. Codex 0.171 also
+ * rebuilds the AGENTS.md + environment preamble inside a mid-turn compaction; that item exists
+ * only in the compacted record's replacement history and its wire copy carries no provenance.
+ * With `allowCurrentCompaction`, such a message is accepted only from the latest compaction of
+ * this very task and is returned to the caller, which must treat it as a current claim. An
+ * ordinary response item recorded after the task boundary never becomes historical.
+ */
 function verifyHistoricalEnvironmentMessages(
   fd: number,
   size: number,
   turnId: string,
   messages: ChatGptUnattributedEnvironmentMessage[],
-): void {
+  options: { allowCurrentCompaction?: boolean } = {},
+): ChatGptUnattributedEnvironmentMessage[] {
   const pending = new Map(messages.map(message => [message.id, message.content]));
   if (pending.size !== messages.length) throw new Error("Codex environment history repeats a message id");
+  let currentTask = false;
+  let superseded = false;
+  let rebuilt: Set<string> | undefined;
   let position = 0;
   let carry = Buffer.alloc(0);
-  while (position < size) {
+  scan: while (position < size) {
     const length = Math.min(ROLLOUT_READ_CHUNK_BYTES, size - position);
     const chunk = Buffer.alloc(length);
     if (readSync(fd, chunk, 0, length, position) !== length) {
@@ -359,11 +389,35 @@ function verifyHistoricalEnvironmentMessages(
       if (line.length > MAX_ROLLOUT_JSON_LINE_BYTES) throw new Error("Codex rollout JSONL record exceeds the bounded record size");
       const item = parseJsonLine(line);
       const payload = record(item.payload);
+      if (currentTask) {
+        // Past the boundary only this task's own compaction can prove anything. A later task
+        // boundary means the request does not describe the latest native task at all.
+        if (item.type === "event_msg" && payload?.type === "task_started") {
+          superseded = true;
+          break scan;
+        }
+        if (item.type === "compacted") {
+          // Each compaction replaces the history Codex replays, so only the latest one counts.
+          rebuilt = new Set([...pending].filter(([id, content]) =>
+            replacementHistoryProves(payload?.replacement_history, id, content)).map(([id]) => id));
+        }
+        continue;
+      }
       // Core writes task_started before this turn's environment update. Merely finding matching
       // XML somewhere in the file would also accept a current update as historical.
       if (item.type === "event_msg" && payload?.type === "task_started" && payload.turn_id === turnId) {
-        if (pending.size === 0) return;
-        throw new Error("Codex rollout does not authenticate the historical environment messages");
+        if (pending.size === 0) return [];
+        if (!options.allowCurrentCompaction) {
+          throw new Error("Codex rollout does not authenticate the historical environment messages");
+        }
+        currentTask = true;
+        continue;
+      }
+      if (item.type === "compacted") {
+        for (const [id, content] of pending) {
+          if (replacementHistoryProves(payload?.replacement_history, id, content)) pending.delete(id);
+        }
+        continue;
       }
       if (item.type !== "response_item" || payload?.type !== "message" || payload.role !== "user"
         || typeof payload.id !== "string" || !pending.has(payload.id)) continue;
@@ -375,7 +429,11 @@ function verifyHistoricalEnvironmentMessages(
     carry = Buffer.from(data.subarray(start));
     if (carry.length > MAX_ROLLOUT_JSON_LINE_BYTES) throw new Error("Codex rollout JSONL record exceeds the bounded record size");
   }
-  throw new Error("Codex rollout has no current task boundary for environment history");
+  if (!currentTask) throw new Error("Codex rollout has no current task boundary for environment history");
+  if (superseded || !rebuilt || rebuilt.size !== pending.size) {
+    throw new Error("Codex rollout does not authenticate the historical environment messages");
+  }
+  return messages.filter(message => rebuilt.has(message.id));
 }
 
 function validateSessionMeta(
@@ -826,14 +884,18 @@ export function resolveCurrentCodexRolloutEnvironment(options: {
           catch { throw error; }
         }
       }
-      if (options.historicalEnvironmentMessages) {
-        verifyHistoricalEnvironmentMessages(fd, size, turnId, options.historicalEnvironmentMessages);
-      }
+      const rebuiltPreambleMessages = options.historicalEnvironmentMessages
+        ? verifyHistoricalEnvironmentMessages(fd, size, turnId, options.historicalEnvironmentMessages,
+          { allowCurrentCompaction: true })
+        : [];
       if (options.compactedEnvironmentItems) {
         verifyCompactedEnvironmentItems(fd, size, options.compactedEnvironmentItems);
       }
       const filesystemProfileXml = renderFilesystemProfile(latest.permission_profile, environment.roots);
-      matching.push({ environment, workspaceRootsDeclared, filesystemProfileXml, rolloutPath });
+      matching.push({
+        environment, workspaceRootsDeclared, filesystemProfileXml, rolloutPath,
+        ...(rebuiltPreambleMessages.length > 0 ? { rebuiltPreambleMessages } : {}),
+      });
     } finally {
       closeSync(fd);
     }

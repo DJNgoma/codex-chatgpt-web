@@ -495,6 +495,29 @@ export function extractChatGptContinuationEnvironmentClaim(parsed: CodexParsedRe
 }
 
 /**
+ * A mid-turn native compaction rebuilds the current preamble without wire provenance. The
+ * rollout reader has matched these messages against this task's latest replacement history;
+ * that proves their origin, not their content. Parse the single environment they carry as a
+ * claim only: the caller must compare it with this turn's native rollout authority.
+ */
+export function extractChatGptRebuiltPreambleClaim(
+  parsed: CodexParsedRequest,
+  messages: ChatGptUnattributedEnvironmentMessage[],
+): ChatGptEnvironmentClaim {
+  const fragments = messages.flatMap(message => {
+    const parts = typeof message.content === "string" ? [message.content]
+      : Array.isArray(message.content) ? message.content.map(part => record(part)?.text) : [];
+    return parts.flatMap(value => {
+      if (typeof value !== "string") return [];
+      const text = value.trim();
+      return /^<environment_context>[\s\S]*<\/environment_context>$/.test(text) ? [text] : [];
+    });
+  });
+  if (fragments.length !== 1) throw new Error("Compaction continuation requires one current native environment claim");
+  return environmentClaim(parsed, fragments[0]!);
+}
+
+/**
  * Pre-turn native compaction can rebuild the current preamble before retained older
  * instructions, without a bridge-owned checkpoint. These items are claims only;
  * the rollout reader must match both against its latest native replacement history.

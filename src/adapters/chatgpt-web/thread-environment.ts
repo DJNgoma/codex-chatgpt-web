@@ -14,6 +14,7 @@ import {
   hasCurrentChatGptEnvironmentContext,
   extractChatGptCalendarEnvironmentDelta,
   extractChatGptNativeCompactionEnvironment,
+  extractChatGptRebuiltPreambleClaim,
   hasRawChatGptEnvironmentContext,
   unattributedChatGptEnvironmentMessages,
   currentChatGptCalendarPreamble,
@@ -249,31 +250,36 @@ export class ChatGptThreadEnvironmentStore {
         });
         if (rollout) {
           let rolloutEnvironment = rollout.environment;
-          let verifiedClaim = currentClaim;
+          // A preamble rebuilt by this task's own compaction is a current claim too. Its origin
+          // is proven by the native replacement history; its content gets the same comparison.
+          const rebuiltClaim = !currentClaim && rollout.rebuiltPreambleMessages
+            ? extractChatGptRebuiltPreambleClaim(parsed, rollout.rebuiltPreambleMessages) : undefined;
+          const claim = currentClaim ?? rebuiltClaim;
+          let verifiedClaim = claim;
           // Full Access roots describe workspace context, not a permission boundary.
           // Codex can add output directories after compaction (#933), or omit native
           // roots after a restart (#847). Keep every declared native project; the
           // exact current rollout still owns cwd, permissions and task identity.
           if (rolloutEnvironment.sandboxPolicy.type === "dangerFullAccess"
-            && currentClaim?.environment.sandboxPolicy.type === "dangerFullAccess"
-            && (currentClaim.environment.cwd === undefined
-              || pathIdentity(currentClaim.environment.cwd) === pathIdentity(rolloutEnvironment.cwd))) {
+            && claim?.environment.sandboxPolicy.type === "dangerFullAccess"
+            && (claim.environment.cwd === undefined
+              || pathIdentity(claim.environment.cwd) === pathIdentity(rolloutEnvironment.cwd))) {
             const nativeRoots = new Set(rolloutEnvironment.roots.map(pathIdentity));
-            const claimedRoots = new Set(currentClaim.environment.roots.map(pathIdentity));
-            const accepted = currentClaim.environment.roots.some(root => contains(root, rolloutEnvironment.cwd))
+            const claimedRoots = new Set(claim.environment.roots.map(pathIdentity));
+            const accepted = claim.environment.roots.some(root => contains(root, rolloutEnvironment.cwd))
               && (!rollout.workspaceRootsDeclared || [...nativeRoots].every(root => claimedRoots.has(root)));
             // A later Desktop turn can have fewer roots than its session started with, even
             // none containing cwd (#939, #945). That is no conflict when Codex itself recorded
             // exactly this filesystem as current. Those start projects remain workspace context.
-            const recorded = !accepted && currentClaim.filesystemXml !== undefined
-              && currentClaim.filesystemXml === latestCodexRolloutFilesystem(rollout.rolloutPath);
+            const recorded = !accepted && claim.filesystemXml !== undefined
+              && claim.filesystemXml === latestCodexRolloutFilesystem(rollout.rolloutPath);
             if (accepted || recorded) {
               const roots = rollout.workspaceRootsDeclared
-                ? [...rolloutEnvironment.roots, ...currentClaim.environment.roots.filter(root => !nativeRoots.has(pathIdentity(root)))]
-                : [...currentClaim.environment.roots];
+                ? [...rolloutEnvironment.roots, ...claim.environment.roots.filter(root => !nativeRoots.has(pathIdentity(root)))]
+                : [...claim.environment.roots];
               rolloutEnvironment = { ...rolloutEnvironment, roots, writableRoots: [...roots] };
               if (recorded) {
-                verifiedClaim = { ...currentClaim, environment: { ...currentClaim.environment, roots, writableRoots: roots } };
+                verifiedClaim = { ...claim, environment: { ...claim.environment, roots, writableRoots: roots } };
               }
             }
           }
@@ -287,7 +293,7 @@ export class ChatGptThreadEnvironmentStore {
           }
           const conflicts = verifiedClaim ? conflictingAuthorityFields(verifiedClaim, rolloutEnvironment) : [];
           if (conflicts.length > 0) {
-            const source = currentCompaction || nativeCompaction ? "Compaction continuation" : initialClaim ? "Current" : "Steering";
+            const source = currentCompaction || nativeCompaction || rebuiltClaim ? "Compaction continuation" : initialClaim ? "Current" : "Steering";
             // Field names are safe to export; paths, request text and permission
             // contents are deliberately excluded from both the log and UI error.
             console.warn(`[chatgpt-web] trusted environment conflict (source=${source}, fields=${conflicts.join(",")})`);

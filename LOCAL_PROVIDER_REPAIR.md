@@ -24,6 +24,50 @@ changes are included.
   installer startup. The next reviewed build should be rebuilt from its
   upstream release tag and tested against the installed DesktopPatches lane.
 
+## Rebuilt preamble after mid-turn compaction (21 November 2026)
+
+Codex CLI 0.171 rebuilds the AGENTS.md and environment message during a
+compaction inside a running turn. That item exists only in the rollout's
+`compacted.replacement_history`. Its wire copy carries no
+`internal_chat_message_metadata_passthrough`. The historical verifier searched
+ordinary response items before the task boundary, so every request after such
+a compaction failed with "Codex rollout does not authenticate the historical
+environment messages" and the goal stalled.
+
+The verifier now also accepts an unattributed environment message when:
+
+- an earlier task's native compaction recorded that exact user message. It
+  stays contextual history and grants nothing.
+- the running task's latest native compaction recorded that exact user
+  message. It is then a current claim. The store parses its single complete
+  environment fragment and compares it with this turn's native authority,
+  exactly like the existing compaction continuation path.
+
+An ordinary response item recorded after the task boundary still never becomes
+historical. A repeated id, a non-user item, changed content, a superseded
+compaction and the date-only calendar preamble are all still rejected.
+
+Changed files: `src/adapters/chatgpt-web/codex-rollout-environment.ts`,
+`environment.ts`, `thread-environment.ts` and `tests/environment.test.ts`
+(six tests named "rebuilt preamble" and "calendar preamble does not gain the
+compaction route"). Runtime tests: 1178 passed, 112 skipped, 0 failed.
+
+The rebuild replaced only the runtime in the reviewed 6.1.19 bundle. Of 4905
+runtime files, `app/cli.js` is the only one that changed. The ASAR is
+unchanged. Activated on 21 November 2026 with
+`repair-evidence/activate-reviewed-r2.py`.
+
+- Installed runtime CLI SHA-256:
+  `86a2997fe0abd9aa75d059cfdf1c7e0a0debba3d155f81d03be45134eaa484c9`
+- Runtime bundle id:
+  `c3127c22a7ecb1763a0cea219d018103e022886a35310a4bcfd08d9a35194053`
+- Rollback bundle:
+  `~/.codex/backups/web-coexistence-6.1.19-r2-20261121T104238Z/Codex Web GPT.app`
+
+Replay of the four real request moments, before and after, is in
+`repair-evidence/rebuilt-preamble/`. This fix is not upstream as of v6.1.19.
+Carry it into the next reviewed build.
+
 ## Verification and rollback
 
 Runtime tests passed (1172 passed, 112 skipped). Launcher tests passed
