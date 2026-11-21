@@ -1,5 +1,5 @@
-import { existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { isAbsolute, resolve } from "node:path";
 import {
   CODEX_REALTIME_WEBRTC_CALL_BASE_URL,
   MANAGED_COMMENT,
@@ -172,12 +172,31 @@ export function verifyManagedJournalState(text: string, journal: ManagedRouteJou
   else verifyRestoredRoute(text, journal);
 }
 
+// This fork also serves the existing CodexDesktopPatches proxy. Its picker is
+// external, and the proxy forwards Web requests to this launcher. Recognize only
+// the known loopback provider with visible Web catalogue entries; setup's foreign
+// catalogue guard still prevents a new integration from taking over its picker.
+export function isLocalCatalogProxy(text: string): boolean {
+  try {
+    const config = Bun.TOML.parse(splitLines(text).join("\n")) as Record<string, any>;
+    if (config.model_provider !== "local_model_bridge"
+      || config.model_providers?.local_model_bridge?.base_url !== "http://127.0.0.1:48111/v1"
+      || typeof config.model_catalog_json !== "string"
+      || !isAbsolute(config.model_catalog_json)) return false;
+    const stat = statSync(config.model_catalog_json);
+    if (!stat.isFile() || stat.size > 4 * 1024 * 1024) return false;
+    const catalog = JSON.parse(readFileSync(config.model_catalog_json, "utf8"));
+    return Array.isArray(catalog.models) && catalog.models.some((row: any) =>
+      typeof row?.slug === "string" && row.slug.startsWith("chatgpt-web-") && row.visibility !== "hide");
+  } catch { return false; }
+}
+
 export function assertBuiltinModelProvider(text: string): void {
   const { model_provider: provider } = Bun.TOML.parse(splitLines(text).join("\n")) as { model_provider?: unknown };
-  if (provider !== undefined && provider !== "openai") {
+  if (provider !== undefined && provider !== "openai" && !isLocalCatalogProxy(text)) {
     throw new Error(
-      "Codex model_provider selects a custom provider; the bridge requires the built-in openai provider. "
-      + "Select model_provider = \"openai\" or remove that selection before setup or reconnect. "
+      "Codex model_provider selects a custom provider; the bridge requires the built-in openai provider "
+      + "or the verified CodexDesktopPatches local catalogue proxy. "
       + "--replace-codex-route only replaces the route URL; it does not change your provider configuration.",
     );
   }
@@ -258,6 +277,29 @@ export function installRoute(
       `Codex already configures model routing (openai_base_url=${JSON.stringify(previous.openai_base_url.value)}). `
       + "Rerun with --replace-codex-route to replace it reversibly. "
       + "Check whether another Codex extension or wrapper (for example, OpenCodex or Headroom) is replacing the bridge port.",
+    );
+  }
+  // A catalog-driven local bridge owns the model picker through `model_catalog_json`, so this
+  // route would be installed but never listed: Codex reads the picker from that catalog, not from
+  // `openai_base_url`. Installing silently on top of one leaves the user with a mutated Codex
+  // config and no visible ChatGPT Web models, so name the owner and fail closed instead. Only the
+  // first install reaches this guard; a managed journal already replaces its own route.
+  // `model_provider` alone is not evidence of one: it names the built-in provider on an ordinary
+  // Codex install. Only `model_catalog_json` replaces the picker's source.
+  const foreignCatalogRoute = previous.model_catalog_json.present
+    ? [
+        `model_catalog_json=${JSON.stringify(previous.model_catalog_json.value)}`,
+        ...(previous.model_provider.present
+          ? [`model_provider=${JSON.stringify(previous.model_provider.value)}`]
+          : []),
+      ]
+    : [];
+  if (foreignCatalogRoute.length > 0 && !replaceExistingRoute) {
+    throw new Error(
+      `Codex already routes its model picker through another local bridge (${foreignCatalogRoute.join(", ")}). `
+      + "That catalog owns the picker, so models installed here would not appear in it. "
+      + "Add the ChatGPT Web models to that bridge's catalog and let it proxy this launcher, "
+      + "or rerun with --replace-codex-route to install anyway; `codex-chatgpt-web uninstall` restores the prior values.",
     );
   }
   const previousRealtimeWebrtcCallBaseUrl = findTopLevelAssignment(

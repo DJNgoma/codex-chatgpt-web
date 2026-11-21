@@ -3,7 +3,8 @@ import type { AppConfig } from "./config";
 import { getConfigDir, getConfigPath, loadConfig } from "./config";
 import { join } from "node:path";
 import { inspectCodexCompaction } from "./doctor-compaction";
-import { inspectCodexIntegration } from "./codex-integration";
+import { getCodexHome, inspectCodexIntegration } from "./codex-integration";
+import { isLocalCatalogProxy } from "./codex-integration-route";
 import { browserLoginStateExists, loginVerificationMarkerPath } from "./browser-login";
 import { getServiceStatus } from "./service";
 import { tunnelStatus } from "./tunnel";
@@ -65,6 +66,17 @@ function launcherOwnershipError(config: AppConfig, health: Record<string, unknow
 function modelCatalogCheck(health: Record<string, unknown>): DoctorCheck {
   const result = health.last_model_catalog_result as { status?: unknown; failure?: { stage?: unknown; code?: unknown } } | null | undefined;
   if (!result || !Number.isInteger(result.status)) {
+    // The verified local proxy builds Codex's picker from disk and forwards only
+    // Web turns here. Reading that evidence must not fabricate a /models request
+    // or imply that an authenticated inference request has completed.
+    try {
+      if (isLocalCatalogProxy(readFileSync(join(getCodexHome(), "config.toml"), "utf8"))) {
+        return {
+          id: "model-catalog", status: "ok",
+          message: "Codex uses the verified external model catalogue; no runtime model-list request is required",
+        };
+      }
+    } catch { /* Missing or unreadable evidence retains the pending warning. */ }
     return { id: "model-catalog", status: "warning", message: "This runtime has not observed a completed Codex model-list request yet" };
   }
   const status = result.status as number;

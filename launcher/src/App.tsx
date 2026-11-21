@@ -25,6 +25,7 @@ import type {
   LauncherSnapshot,
   LauncherState,
   LogRecord,
+  ModelCheckReport,
   OperationState,
   Surface,
 } from "./types";
@@ -1153,6 +1154,8 @@ function SetupSurface({
   updateState: (state: LauncherState) => void;
 }) {
   const [localBusy, setLocalBusy] = useState(false);
+  const [modelCheck, setModelCheck] = useState<ModelCheckReport | null>(null);
+  const [checkingModels, setCheckingModels] = useState(false);
   const manualInteraction = snapshot.state.browserInteractionMode === "manual";
   const busy = localBusy
     || operation?.status === "running"
@@ -1184,8 +1187,20 @@ function SetupSurface({
     updateState((await api!.snapshot()).state);
   });
   const install = () => run(async () => {
+    setModelCheck(null);
     await api!.setupCore();
     updateState((await api!.snapshot()).state);
+  });
+  // Reads what Codex will read and changes nothing, so the answer costs no reinstall.
+  const checkModels = () => run(async () => {
+    setCheckingModels(true);
+    try {
+      const report = await api!.checkModels();
+      setModelCheck(report);
+      if (report.state) updateState(report.state);
+    } finally {
+      setCheckingModels(false);
+    }
   });
   const setZeroRiskPro = (enabled: boolean) => run(async () => {
     updateState(await api!.setZeroRiskPro(enabled));
@@ -1232,7 +1247,12 @@ function SetupSurface({
           disabled={busy || (!snapshot.smokePassed && snapshot.state.coreSetupComplete !== true)}
           index={manualInteraction ? 1 : 3}
           onAction={install}
+          onSecondaryAction={devProfile ? undefined : checkModels}
           repeatable
+          secondaryAction={devProfile
+            ? undefined
+            : checkingModels ? copy.checkingModels : copy.checkModels}
+          secondaryDisabled={busy}
           title={devProfile ? copy.devStepInstall : copy.stepInstall}
           titleAction={manualInteraction ? (
             <ZeroRiskModelMenu
@@ -1244,6 +1264,8 @@ function SetupSurface({
           ) : undefined}
         />
       </div>
+
+      {modelCheck ? <ModelCheckNotice copy={copy} report={modelCheck} /> : null}
 
       {!devProfile && snapshot.state.codexRestartRequired ? (
         <NoticeRow icon="alert" tone="warning">
@@ -2065,7 +2087,7 @@ function SetupRow({
       </div>
       <div className="setup-actions">
         {secondaryAction && onSecondaryAction ? (
-          <SecondaryButton disabled={secondaryDisabled || complete} onClick={onSecondaryAction}>
+          <SecondaryButton disabled={secondaryDisabled} onClick={onSecondaryAction}>
             {secondaryAction}
           </SecondaryButton>
         ) : null}
@@ -2300,6 +2322,39 @@ function NoticeRow({
       <Icon name={icon} />
       <span>{children}</span>
     </div>
+  );
+}
+
+// Says which source owns the picker as well as what it lists: on a machine where another local
+// bridge owns it, "no models" and "models this launcher cannot see" are different answers.
+function ModelCheckNotice({ copy, report }: { copy: Copy; report: ModelCheckReport }) {
+  const external = report.source === "external";
+  // A catalog that lists the models while this bridge's route is missing is a third state: the
+  // picker entries exist but nothing routes them here, and telling the user the catalog is empty
+  // would be false.
+  const summary = !report.catalogReadable || report.source === "unknown" ? copy.modelsUnknownSource : report.installed
+    ? external ? copy.modelsInstalledCatalog : copy.modelsInstalledBridge
+    : external
+      ? report.models.length > 0 ? copy.modelsRouteMissing : copy.modelsMissingCatalog
+      : copy.modelsMissingBridge;
+  // A catalog can list an entry that Codex hides from the picker, and several hidden entries often
+  // share one display name. Name what is selectable; fall back to slugs when nothing is.
+  const visible = report.models.filter(model => model.visible);
+  const listed = visible.length > 0
+    ? [...new Set(visible.map(model => model.displayName))]
+    : report.models.map(model => model.slug);
+  return (
+    <NoticeRow icon={report.runtimeVerified ? "check" : "alert"} tone={report.runtimeVerified ? "success" : "warning"}>
+      {summary}
+      {listed.length > 0 ? ` ${listed.join(", ")}.` : ""}
+      {external && report.catalogPath
+        ? <small className="notice-detail">{`${copy.modelsPickerSource}: ${report.catalogPath}`}</small>
+        : null}
+      {external && report.installed
+        ? <small className="notice-detail">{copy.modelsRuntimeUnverified}</small>
+        : null}
+      {report.detail ? <small className="notice-detail">{report.detail}</small> : null}
+    </NoticeRow>
   );
 }
 
