@@ -20,7 +20,7 @@ import {
 import { namespacedToolName, type AdapterEvent, type CodexContentPart, type CodexParsedRequest, type CodexProviderConfig, type CodexToolResultMessage, type CodexUsage } from "../../types";
 import type { ProviderAdapter } from "../base";
 import { parseDataUrl } from "../image";
-import { ChatGptWebAdapterError, chatGptToolTimeoutError } from "./adapter-error";
+import { ChatGptWebAdapterError, chatGptFailureCauseEvidence, chatGptToolTimeoutError, chatGptTurnRetiredError, isChatGptTurnRetired } from "./adapter-error";
 import { ChatGptBrowserWorker, chatGptSuspensionClock, remainingStageBudgetMs } from "./browser-worker";
 import { extractChatGptTurnEnvironment, extractChatGptTurnIdentity, priorChatGptAbortedTurnIds } from "./environment";
 import { CHATGPT_WEB_LUNA_MODEL_ID, resolveChatGptWebModelMode, type ChatGptWebCapabilities } from "./model";
@@ -327,7 +327,29 @@ function submittedTurnFailure(session: ChatGptTurnSession, error: unknown, parse
   if (normalized instanceof ChatGptWebAdapterError) return normalized;
   const phase = session.runtime.submission?.phase;
   if (!phase || phase === "prepared") return normalized;
+  // A turn whose Codex-side binding went away did not stop because of anything ChatGPT did, and
+  // sending the user to the ChatGPT tab for it points at the one component that was still working.
+  if (isChatGptTurnRetired(normalized)) {
+    return new ChatGptWebAdapterError(
+      "The Codex request for this turn ended while ChatGPT was still working, so the turn was retired "
+      + "before ChatGPT could return its next tool call. ChatGPT is not at fault: check whether a proxy, "
+      + "wrapper or bridge between Codex and this route closed the response stream.",
+      {
+        status: 502,
+        errorType: "server_error",
+        code: "chatgpt_turn_retired",
+        retryable: false,
+        cause: normalized,
+      },
+    );
+  }
   const ambiguous = phase === "send_activated";
+  // The message below is all Codex shows. Record the actual reason once, where it can be found.
+  try {
+    console.warn(`[chatgpt-web] submitted_turn_failed ${JSON.stringify({ phase, ...chatGptFailureCauseEvidence(normalized) })}`);
+  } catch {
+    // Diagnostics must never change how the turn ends.
+  }
   return new ChatGptWebAdapterError(
     ambiguous
       ? "ChatGPT did not confirm that the prompt was sent. Check the ChatGPT tab before continuing."
@@ -527,7 +549,7 @@ export function createChatGptWebAdapter(
         failure => {
           const retirement = failure
             ? chatGptToolTimeoutError(failure.tool, failure.timeoutMs)
-            : new Error("Codex Native retired the turn binding before its tool work completed");
+            : chatGptTurnRetiredError("Codex Native retired the turn binding before its tool work completed");
           externalProgress.retire(retirement);
           if (!browserOwnerSettled && !browserAbort.signal.aborted) browserAbort.abort(retirement);
         },
