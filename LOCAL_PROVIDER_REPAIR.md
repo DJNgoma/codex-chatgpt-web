@@ -2,18 +2,16 @@
 
 ## Where this lives
 
-This is branch `codex/local-provider-6.1.19` of the personal fork
-`DJNgoma/codex-chatgpt-web`. It is the build installed at
-`/Applications/Codex Web GPT.app`. The only working copy is
-`~/Developer/codex-chatgpt-web`. The per-version sibling folders were
-consolidated into it on 21 November 2026.
+This is the record for the 6.1.19 local build of the personal fork
+`DJNgoma/codex-chatgpt-web`, the build installed at
+`/Applications/Codex Web GPT.app`. Its source is branch
+`codex/local-provider-6.1.19`, which is merged into `main`. The only working
+copy is `~/Developer/codex-chatgpt-web`, checked out on `main`. The per-version
+sibling folders were consolidated into it on 21 November 2026.
 
-The branch map, the list of local fixes and the steps for taking a new upstream
-release are in `FORK_WORKFLOW.md` on `main`. Read it without switching branch:
-
-```sh
-git show main:FORK_WORKFLOW.md
-```
+`FORK_WORKFLOW.md` on `main` has the branch map, the list of local fixes and
+the steps for taking a new upstream release. Installed builds are tagged
+`local-build/<version>-r<n>`.
 
 Private evidence for this build is in `repair-evidence/`. Earlier versions are
 in `repair-evidence/archive/`. That directory is local only and is never
