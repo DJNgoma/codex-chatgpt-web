@@ -1,9 +1,114 @@
-# Personal fork workflow and integration rationale
+# Personal fork of codex-chatgpt-web
+
+This is `DJNgoma/codex-chatgpt-web`, a personal fork of
+[`miuuyy/codex-chatgpt-web`](https://github.com/miuuyy/codex-chatgpt-web). It
+exists to run Codex Web GPT beside a separate local model bridge
+(CodexDesktopPatches, `http://127.0.0.1:48111/v1`) and to carry a few fixes
+until upstream has them. It is not a release channel. Install upstream from
+upstream.
+
+Last updated 21 November 2026.
+
+## Where the current work is
+
+**`main` is not the installed build.** It is the fork's index and the last
+merge-based integration (upstream 6.1.8). The build that is actually installed
+lives on the newest `codex/local-provider-<version>` branch.
+
+| Branch | Based on | Status | What it holds |
+| --- | --- | --- | --- |
+| `codex/local-provider-6.1.19` | upstream `v6.1.19` | **Installed** (since 20 Nov 2026, runtime rebuilt 21 Nov) | Local provider coexistence, review-required updater, current-turn calendar preamble, rebuilt preamble after mid-turn compaction. Record: `LOCAL_PROVIDER_REPAIR.md` on that branch. |
+| `codex/local-provider-6.1.18` | upstream `v6.1.18` | Superseded | Local provider coexistence, calendar preamble, passkey storage bounds (upstream since 6.1.19). |
+| `codex/local-provider-6.1.17` | upstream `v6.1.17` | Superseded | First port of the provider and external-catalogue changes onto an upstream release tag. One snapshot commit of what was installed on 2 Nov 2026. |
+| `main` | upstream 6.1.8 merge | Historical integration | Upstream 6.1.8 merged with the fork's catalogue evidence and turn-retirement messages. This file. |
+| `codex/external-catalog-5.0.8` | upstream `v5.0.8` | Historical | First prototype of the external catalogue checks. One snapshot commit. |
+| `codex/passkey-login-integration` | upstream 5.0.4 | Historical, merged into `main` | Passkey sign-in, catalogue routing, hook recovery. |
+| `codex/tunnel-health-rediscovery` | upstream 5.0.4 | Closed upstream PR #354 | Tunnel health rediscovery. |
+| `codex/viewport-retry-classification` | upstream 5.0.4 | Closed upstream PR #355 | Viewport retry classification. |
+| `codex/runtime-reliability-review` | upstream 5.0.4 | Historical | The two fixes above on one review branch. |
+| `passkey-login-supersede` | upstream 5.0.1 | Historical. Do not force-push | Original passkey supersede work. Its pre-rebase state is `backup/passkey-login-supersede-prerebase`. |
+| `backup/pre-6.1.8-20261013` | upstream 5.0.4 | Backup | Fork `main` before the 6.1.8 merge. |
+
+## The local patch set
+
+Each reviewed build re-applies these on the exact upstream release tag. Check
+upstream first: a fix that has landed upstream is dropped, not carried.
+
+| Fix | Since | Upstream |
+| --- | --- | --- |
+| Accept the existing `local_model_bridge` provider when its URL is exactly `http://127.0.0.1:48111/v1` and its absolute catalogue lists visible `chatgpt-web-*` models | 6.1.8 | Not upstream, local by design |
+| Recognise an external catalogue without claiming a restart or a verified native request | 6.1.8 | Not upstream, local by design |
+| Updater shows new upstream versions as needing a compatibility review and refuses direct installation | 6.1.18 | Not upstream, local by design |
+| Authenticate the current-turn date/timezone preamble against its native rollout record | 6.1.18 | Open issue #1004 |
+| Authenticate the preamble Codex rebuilds in a mid-turn compaction | 6.1.19 (21 Nov 2026) | Not reported yet |
+| Passkey session import accepts browser-valid local storage with aggregate bounds | 6.1.18 | Fixed in 6.1.19 (issue #991), dropped |
+
+## One checkout
+
+There is one working copy: `~/Developer/codex-chatgpt-web`, checked out on the
+installed branch. Remotes: `origin` is this fork, `upstream` is
+`miuuyy/codex-chatgpt-web`. `remote.pushDefault` is `origin`.
+
+Do not create sibling folders per version. They were consolidated on
+21 November 2026:
+
+| Old folder | Now |
+| --- | --- |
+| `codex-chatgpt-web` (on `main`) | The one checkout, switched to the installed branch |
+| `codex-chatgpt-web-local-provider-6.1.19` | Branch `codex/local-provider-6.1.19`, checked out in the one checkout |
+| `codex-chatgpt-web-local-provider-6.1.18` | Branch `codex/local-provider-6.1.18` |
+| `codex-chatgpt-web-local-provider-6.1.17` | Branch `codex/local-provider-6.1.17` (uncommitted work recorded as a snapshot commit) |
+| `codex-chatgpt-web-coexistence` | Branch `codex/external-catalog-5.0.8` (uncommitted work recorded as a snapshot commit) |
+
+When a second tree is needed, for example to compare against the previous
+version, add a temporary worktree inside the checkout and remove it afterwards:
+
+```sh
+git worktree add .worktrees/<name> <branch>
+git worktree remove .worktrees/<name>
+```
+
+`.worktrees/` and `repair-evidence/` are ignored through `.git/info/exclude`.
+Do not put a test worktree under `/tmp`: the runtime's durable-path guard fails
+there.
+
+## Private evidence stays local
+
+Build logs, activation scripts, replay scripts and anything derived from real
+Codex threads live in `repair-evidence/` in the checkout. Older versions are
+under `repair-evidence/archive/<version>/`. None of it is committed. This fork
+is public.
+
+## Moving to a new upstream release
+
+1. `git fetch upstream --tags`, then read the upstream changes since the
+   installed tag. Decide which rows of the patch set are still needed.
+2. `git switch -c codex/local-provider-<new> v<new>` in the one checkout.
+3. Cherry-pick the still-needed commits from the previous
+   `codex/local-provider-*` branch and resolve against the new source.
+4. `bun install --frozen-lockfile` at the root and in `launcher/`.
+5. Run the runtime tests (`bun test ./tests`), the launcher tests, and both
+   type checks.
+6. Build the runtime with the exact Bun pinned in `package.json`
+   (`packageManager`). A different Bun version is rejected by the build script.
+7. Package, run `scripts/smoke-local-package.py` and
+   `scripts/smoke-local-provider.ts`, then activate with the drain, quit, swap
+   and verify script kept in `repair-evidence/`.
+8. Write `LOCAL_PROVIDER_REPAIR.md` on the new branch, push the branch, and
+   update the two tables above on `main`.
+
+Publishing to this fork is fine. Opening an upstream pull request or issue
+needs the owner's explicit confirmation each time. Never push `v*` tags here:
+the release workflow is tag-triggered.
+
+## History
+
+### 6 September 2026: fork setup and integration rationale
 
 Recorded on 6 September 2026. This is a fork-maintenance record, not an upstream
 release-readiness claim.
 
-## Repository ownership and defaults
+### Repository ownership and defaults
 
 - Personal fork and push target: `DJNgoma/codex-chatgpt-web` (`origin`).
 - Upstream source: `miuuyy/codex-chatgpt-web` (`upstream`).
@@ -14,7 +119,7 @@ release-readiness claim.
   deployment has been configured. Upstream issues and PRs require an explicit
   repository target.
 
-## Why a new integration branch exists
+### Why a new integration branch exists
 
 `passkey-login-supersede` originally described allowing a macOS passkey sign-in
 request to supersede an in-progress embedded login. The local work subsequently
@@ -38,7 +143,7 @@ application commits. Its subsequent catalogue-verification fix is described
 below. Uncommitted changes in the active checkout are outside the published
 snapshot and must not be silently staged, discarded, or treated as tested.
 
-## Verification of the committed application snapshot
+### Verification of the committed application snapshot
 
 Validation used a separate copy of the committed snapshot with isolated home,
 Codex, and application configuration directories:
@@ -57,7 +162,7 @@ durable-runtime-path guard. Moving the same snapshot to a separate durable
 directory resolved those environment-related failures without changing source
 or weakening the guard.
 
-## Catalogue fix and fork merge validation
+### Catalogue fix and fork merge validation
 
 The follow-up fix separates catalogue availability from runtime evidence:
 
@@ -108,7 +213,7 @@ The eight existing edits in the active checkout were reviewed separately. They
 cover tunnel-health rediscovery, viewport failure classification, their tests,
 and documentation. They remain outside this merge and its verified snapshot.
 
-## Remaining review and publication gates
+### Remaining review and publication gates
 
 Fork integration is authorised. Packaged-app acceptance on the other platforms
 and installed login/session testing are not established by the macOS verification
@@ -119,7 +224,7 @@ Publishing to the personal fork is authorised. Opening an upstream PR remains
 subject to the owner's explicit confirmation after the final diff, duplicate-fix
 assessment, and actual test results have been presented.
 
-## Active-use safety
+### Active-use safety
 
 Git metadata changes, isolated tests, and fork pushes do not require closing
 ChatGPT. This work does not install a build, replace a running runtime, edit the
@@ -131,11 +236,11 @@ Installed login/session and restart-dependent acceptance checks remain deferred.
 Explain the exact interruption and obtain approval before any such test changes
 active use.
 
-## Assistance acknowledgement
+### Assistance acknowledgement
 
 Prepared with assistance from ChatGPT Web GPT-6 Pro.
 
-## 13 October 2026 integration
+### 13 October 2026 integration
 
 Merged upstream main `0b6087c` (6.1.8) into the personal fork. Backup branch:
 `backup/pre-6.1.8-20261013`. Upstream now owns passkey handoff, authentication

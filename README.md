@@ -1,3 +1,5 @@
+> **Personal fork.** This is `DJNgoma/codex-chatgpt-web`, kept to run Codex Web GPT beside a separate local model bridge. `main` is not the installed build. See [FORK_WORKFLOW.md](FORK_WORKFLOW.md) for the branch map, the local patch set and how a new upstream release is taken. For the product itself, use [miuuyy/codex-chatgpt-web](https://github.com/miuuyy/codex-chatgpt-web). The rest of this file is upstream's README as of 6.1.8.
+
 <p align="center">
   <img src="assets/readme/hero.svg" width="960" alt="Switch to web models. Stay in Codex. Your ChatGPT plan. Your workflow. Maximum capabilities.">
 </p>
