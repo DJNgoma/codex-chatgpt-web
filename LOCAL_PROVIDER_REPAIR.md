@@ -60,11 +60,14 @@ The verifier now also accepts an unattributed environment message when:
 - the running task's latest native compaction recorded that exact user
   message. It is then a current claim. The store parses its single complete
   environment fragment and compares it with this turn's native authority,
-  exactly like the existing compaction continuation path.
+  exactly like the existing compaction continuation path. It never changes
+  the environment the turn runs with (see the next section).
 
 An ordinary response item recorded after the task boundary still never becomes
-historical. A repeated id, a non-user item, changed content, a superseded
-compaction and the date-only calendar preamble are all still rejected.
+historical. A repeated id, a non-user item, changed content and a superseded
+compaction are all still rejected. The date-only calendar preamble does not
+gain the current-task compaction route. Like any other message it can be
+proven historical by an earlier task's compaction.
 
 Changed files: `src/adapters/chatgpt-web/codex-rollout-environment.ts`,
 `environment.ts`, `thread-environment.ts` and `tests/environment.test.ts`
@@ -86,6 +89,74 @@ unchanged. Activated on 21 November 2026 with
 Replay of the four real request moments, before and after, is in
 `repair-evidence/rebuilt-preamble/`. This fix is not upstream as of v6.1.19.
 Carry it into the next reviewed build.
+
+## Stable environment across rounds (21 November 2026, build r3)
+
+The first build of the fix above let the first request after a mid-turn
+compaction through, and the turn then failed on its second round with "ChatGPT
+stopped responding after the task started". The rebuilt preamble's claim merged
+its roots into the Full Access workspace list for round one. Once the model had
+answered, the same preamble no longer read as a current update, round two
+resolved from the rollout alone, and the broker refused the tool loop with
+"Codex turn environment changed during an active ChatGPT tool loop".
+
+A rebuilt preamble is still compared with the native authority and rejected on
+conflict. It no longer shapes the returned environment. Commit `ac2f8aa`.
+Activated with `repair-evidence/activate-reviewed-r3.py`.
+
+- Installed runtime CLI SHA-256:
+  `a1206f43252e4731bcdd8fdaa1cdb03f2590be791e346773edf83273090dc172`
+- Runtime bundle id prefix: `7eb2676f7edf97ed`
+- Tag: `local-build/6.1.19-r3`. The earlier build is `local-build/6.1.19-r2`.
+- Rollback bundle:
+  `~/.codex/backups/web-coexistence-6.1.19-r3-20261121T111307Z/Codex Web GPT.app`
+
+## Audit of 21 November 2026
+
+An independent read of the whole local patch set found no fail-open path and no
+blocking defect in the authentication changes. It did find the items below.
+Three commits follow build r3 and are **not installed yet**. They need a full
+package build because one of them changes the launcher's ASAR.
+
+Changed:
+
+- **Rollout scan time.** Verifying an unattributed environment message took
+  29 s on a real 6.7 GB rollout, on the first request of every turn. Records
+  spanning read chunks are now joined once instead of re-copied per chunk, and
+  before the task boundary only records that name a task boundary or carry a
+  claimed message id are parsed. The same request takes 5.9 s. Commit `d006957`.
+- **Record size bound.** Raised from 16 MiB to 64 MiB. Native compaction
+  records already exceed 10 MiB on this task and grow with it. One record over
+  the bound failed every later verification of the thread. Commit `d006957`.
+- **Turn diagnostics.** Fork `main` carried turn-retirement and client
+  disconnect diagnostics on 6.1.8. They were dropped without record when the
+  patch set moved to per-release branches. They are restored, and a submitted
+  turn that fails now logs its real reason as `submitted_turn_failed`. Commit
+  `16ab981`.
+- **Hidden catalogue rows.** The launcher counted hidden ChatGPT Web rows as
+  proof that the external catalogue lists the models. It now needs a visible
+  row, as the runtime already did. Commit `8f4dcbe`.
+
+Reviewed and left as they are:
+
+- `codexRestartRequired` stays set under an external catalogue. A file cannot
+  prove that Codex restarted, so this is the intended evidence policy.
+- The updater's review-required policy depends on `localBuildPolicy` in the
+  packaged manifest. A launcher test asserts the manifest carries it.
+- `TROUBLESHOOTING.md` additions from fork `main` were not ported.
+
+Known limits:
+
+- An ordinary environment update recorded after a mid-turn compaction, in the
+  same turn, is still rejected together with the rebuilt preamble. The wire has
+  no provenance to tell the two apart. This would stall the turn again.
+- A date-only preamble rebuilt by a compaction in the running turn is still
+  rejected by design.
+- The first request of a turn still reads the whole rollout once.
+
+Verification of the audit commits: runtime tests 1197 passed, 112 skipped, 0
+failed. Launcher tests 501 passed, 1 skipped, 0 failed. Both type checks pass.
+`bun audit` reports no vulnerabilities in either dependency set.
 
 ## Verification and rollback
 
