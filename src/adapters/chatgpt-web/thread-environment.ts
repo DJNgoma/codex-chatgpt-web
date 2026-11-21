@@ -252,7 +252,12 @@ export class ChatGptThreadEnvironmentStore {
           let rolloutEnvironment = rollout.environment;
           // A preamble rebuilt by this task's own compaction is a current claim too. Its origin
           // is proven by the native replacement history; its content gets the same comparison.
-          const rebuiltClaim = !currentClaim && rollout.rebuiltPreambleMessages
+          // The extractors make a rebuilt preamble and another current claim mutually exclusive.
+          // Fail closed if that ever stops holding rather than leave one of them uncompared.
+          if (currentClaim && rollout.rebuiltPreambleMessages) {
+            throw new Error("Compaction continuation requires one current native environment claim");
+          }
+          const rebuiltClaim = rollout.rebuiltPreambleMessages
             ? extractChatGptRebuiltPreambleClaim(parsed, rollout.rebuiltPreambleMessages) : undefined;
           const claim = currentClaim ?? rebuiltClaim;
           let verifiedClaim = claim;

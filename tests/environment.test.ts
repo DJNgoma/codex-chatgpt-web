@@ -2686,7 +2686,7 @@ ${inventory}</environment_context>` }],
   //  6. a preamble rebuilt by an earlier task's compaction blocks the next turn
   //  7. an ambiguous (repeated id) or non-user native item proves the message
   //  8. a rebuilt item without exactly one complete environment fragment becomes authority
-  //  9. the date-only calendar preamble silently gains this compaction route
+  //  9. the date-only calendar preamble silently gains the current-task compaction route
   // 10. the rebuilt preamble's roots shape the first round's environment but not the next
   //     round's, and the broker then refuses the tool loop as a changed environment
   function rebuiltPreambleFixture(environmentText = environmentXml) {
@@ -2772,6 +2772,57 @@ ${inventory}</environment_context>` }],
     expect(first.roots).toEqual([root]);
   });
 
+  // 11. the order Codex really writes (boundary, turn context, work, compaction, world state,
+  //     turn context again) or a repeated boundary is handled differently from the fixtures
+  // 12. a request mixing historical, rebuilt and unproven messages is judged as a whole wrongly
+  // 13. a rebuilt claim widens a restricted sandbox
+  test("the native mid-turn record order proves a rebuilt preamble; a repeated boundary does not", () => {
+    const fixture = rebuiltPreambleFixture();
+    const { codexHome, request, preamble, summary, native, write, sessionMeta, taskStarted, compacted } = fixture;
+    const worldState = { type: "world_state", payload: { full: true, state: { environments: { current_date: "2026-11-21" } } } };
+    const store = new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome);
+    write([sessionMeta, taskStarted(), childTurnContext(), filler(1000),
+      compacted([native(preamble), native(summary)]), worldState, childTurnContext()]);
+    expect(store.resolve(request).cwd).toBe(root);
+    write([sessionMeta, taskStarted(), childTurnContext(), compacted([native(preamble), native(summary)]),
+      taskStarted(), childTurnContext()]);
+    expect(() => store.resolve(request)).toThrow("does not authenticate the historical environment messages");
+  });
+
+  test("historical, rebuilt and unproven messages in one request are judged together", () => {
+    const fixture = rebuiltPreambleFixture();
+    const { codexHome, request, body, preamble, summary, native, write, sessionMeta, taskStarted, compacted } = fixture;
+    const older = { type: "message", role: "user", id: "msg_older_environment", content: [{ type: "input_text",
+      text: "<environment_context>\n  <current_date>2026-11-20</current_date>\n  <timezone>Africa/Johannesburg</timezone>\n  <filesystem><workspace_roots><root>/elsewhere</root></workspace_roots></filesystem>\n</environment_context>" }] };
+    body.input.unshift(older);
+    const store = new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome);
+    const history = { type: "response_item", payload: native(older, "01a06c66-0000-75c6-a0df-318f890ef6de") };
+    // One proven before the boundary, one by this task's compaction.
+    write([sessionMeta, history, taskStarted(), compacted([native(preamble), native(summary)]), childTurnContext()]);
+    expect(store.resolve(request).cwd).toBe(root);
+    // The rebuilt one is proven but the older one is recorded nowhere: nothing is accepted.
+    write([sessionMeta, taskStarted(), compacted([native(preamble), native(summary)]), childTurnContext()]);
+    expect(() => store.resolve(request)).toThrow("does not authenticate the historical environment messages");
+    // Two rebuilt messages that each carry a complete environment are not one claim.
+    write([sessionMeta, taskStarted(), compacted([native(older), native(preamble), native(summary)]), childTurnContext()]);
+    expect(() => store.resolve(request)).toThrow("requires one current native environment claim");
+  });
+
+  test("a rebuilt Full Access claim cannot widen a read-only turn", () => {
+    const fixture = rebuiltPreambleFixture();
+    const { codexHome, request, body, preamble, summary, native, write, sessionMeta, taskStarted, compacted } = fixture;
+    const raw = body as unknown as { client_metadata: Record<string, string> };
+    raw.client_metadata["x-codex-turn-metadata"] = JSON.stringify({
+      ...JSON.parse(raw.client_metadata["x-codex-turn-metadata"]!), sandbox_mode: "read-only" });
+    write([sessionMeta, taskStarted(), compacted([native(preamble), native(summary)]), childTurnContext(rolloutTurnId, {
+      sandbox_policy: { type: "read-only" },
+      permission_profile: { type: "managed", file_system: { type: "restricted",
+        entries: [{ path: { type: "special", value: { kind: "root" } }, access: "read" }] }, network: "restricted" },
+    })]);
+    expect(() => new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(request))
+      .toThrow("Compaction continuation environment conflicts");
+  });
+
   test("a rebuilt preamble that contradicts the current turn context is rejected", () => {
     const elsewhere = join(dirname(root), "unproven-project");
     const fixture = rebuiltPreambleFixture(environmentXml.replaceAll(root, elsewhere));
@@ -2810,7 +2861,7 @@ ${inventory}</environment_context>` }],
     expect(() => store.resolve(request)).toThrow("does not authenticate the historical environment messages");
   });
 
-  test("the calendar preamble does not gain the compaction route", () => {
+  test("the calendar preamble does not gain the current-task compaction route", () => {
     const calendar = "<environment_context>\n  <current_date>2026-11-21</current_date>\n  <timezone>Africa/Johannesburg</timezone>\n</environment_context>";
     const fixture = rebuiltPreambleFixture(calendar);
     const { codexHome, request, body, preamble, summary, native, write, sessionMeta, taskStarted, compacted } = fixture;
@@ -2819,6 +2870,115 @@ ${inventory}</environment_context>` }],
     expect(body.input[0]).toBe(preamble);
     expect(() => new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(request))
       .toThrow("does not authenticate the current calendar preamble");
+  });
+
+  // The rollout readers visit files of several gigabytes whose records run to megabytes. Ways the
+  // line reader and its relevance filter could fail, each covered below:
+  //  1. a record spanning many read chunks is reassembled wrongly
+  //  2. a record that ends exactly on a read-chunk edge is split, merged or dropped
+  //  3. the filter skips the task boundary, a proving record or a contradicting record
+  //  4. a record over the size bound is no longer refused, terminated or not
+  //  5. an unterminated final record is treated as complete
+  //  6. damaged JSON in a record that matters is ignored
+  const READ_CHUNK = 64 * 1024;
+  const filler = (bytes: number) => ({ type: "response_item", payload: { type: "message", role: "assistant",
+    id: "msg_filler", content: [{ type: "output_text", text: "x".repeat(bytes) }] } });
+  const jsonl = (records: unknown[]) => records.map(value => JSON.stringify(value)).join("\n") + "\n";
+
+  test("records larger than a read chunk prove and contradict exactly", () => {
+    const fixture = rebuiltPreambleFixture();
+    const { codexHome, request, preamble, summary, native, write, sessionMeta, taskStarted, compacted } = fixture;
+    // Seven read chunks of instructions inside the message that has to match byte for byte.
+    (preamble.content[0] as { text: string }).text = `# AGENTS.md instructions\n${"rule ".repeat(90_000)}`;
+    const retained = { type: "message", role: "user", id: "msg_large_retained",
+      content: [{ type: "input_text", text: "y".repeat(5 * READ_CHUNK + 17) }] };
+    const store = new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome);
+    const earlierTurnId = "01a06c66-0000-75c6-a0df-318f890ef6de";
+    for (const records of [
+      // proven by this task's compaction, after megabyte-sized records on both sides of the boundary
+      [sessionMeta, filler(3 * READ_CHUNK + 5), taskStarted(), filler(2 * READ_CHUNK + 1),
+        compacted([native(retained), native(preamble), native(summary)]), childTurnContext()],
+      // proven by an earlier task's compaction
+      [sessionMeta, taskStarted(earlierTurnId), compacted([native(retained, earlierTurnId), native(preamble, earlierTurnId)]),
+        filler(4 * READ_CHUNK), taskStarted(), childTurnContext()],
+      // proven by an ordinary response item
+      [sessionMeta, filler(READ_CHUNK - 3), { type: "response_item", payload: native(preamble) }, taskStarted(), childTurnContext()],
+    ]) {
+      write(records);
+      expect(store.resolve(request).cwd).toBe(root);
+    }
+    // One changed character deep inside the large record is still a different message.
+    const changed = structuredClone(preamble);
+    const text = (changed.content[0] as { text: string }).text;
+    (changed.content[0] as { text: string }).text = `${text.slice(0, 200_000)}X${text.slice(200_001)}`;
+    write([sessionMeta, taskStarted(), compacted([native(retained), native(changed), native(summary)]), childTurnContext()]);
+    expect(() => store.resolve(request)).toThrow("does not authenticate the historical environment messages");
+    write([sessionMeta, { type: "response_item", payload: native(changed) }, taskStarted(), childTurnContext()]);
+    expect(() => store.resolve(request)).toThrow("differs from its native Codex record");
+  });
+
+  test.each([-2, -1, 0, 1, 2])("a record ending %i bytes from a read-chunk edge is neither split nor dropped", offset => {
+    const fixture = rebuiltPreambleFixture();
+    const { codexHome, request, rolloutPath, preamble, summary, native, sessionMeta, taskStarted, compacted } = fixture;
+    const store = new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome);
+    // Pad one filler record so the next record starts `offset` bytes from the second chunk.
+    const padTo = (prefix: unknown[], target: number) => {
+      const before = Buffer.byteLength(jsonl([...prefix, filler(0)]));
+      return [...prefix, filler(target - before)];
+    };
+    // The proving record, then the task boundary, then the compaction each sit on the edge in turn.
+    const proof = { type: "response_item", payload: native(preamble) };
+    for (const records of [
+      [...padTo([sessionMeta], READ_CHUNK + offset), proof, taskStarted(), childTurnContext()],
+      [...padTo([sessionMeta, proof], 2 * READ_CHUNK + offset), taskStarted(), childTurnContext()],
+      [...padTo([sessionMeta, taskStarted()], 3 * READ_CHUNK + offset), compacted([native(preamble), native(summary)]), childTurnContext()],
+      // The authority lookup reads backwards: the turn context ends on a chunk edge counted from
+      // the end of the file, behind a record that spans two chunks.
+      [sessionMeta, proof, taskStarted(), childTurnContext(),
+        filler(2 * READ_CHUNK + offset - Buffer.byteLength(jsonl([filler(0)])))],
+    ]) {
+      writeFileSync(rolloutPath, jsonl(records));
+      expect(store.resolve(request).cwd).toBe(root);
+    }
+    // The same layouts without the proof stay rejected: nothing is conjured from a neighbour.
+    writeFileSync(rolloutPath, jsonl([...padTo([sessionMeta], READ_CHUNK + offset), taskStarted(), childTurnContext()]));
+    expect(() => store.resolve(request)).toThrow("does not authenticate the historical environment messages");
+  });
+
+  test("oversized, unterminated and damaged records fail closed where they matter", () => {
+    const fixture = rebuiltPreambleFixture();
+    const { codexHome, request, rolloutPath, preamble, native, sessionMeta, taskStarted } = fixture;
+    const store = new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome);
+    const proof = JSON.stringify({ type: "response_item", payload: native(preamble) });
+    const lines = (...values: unknown[]) => values.map(value => typeof value === "string" ? value : JSON.stringify(value));
+    const put = (values: string[], terminated = true) => writeFileSync(rolloutPath, values.join("\n") + (terminated ? "\n" : ""));
+    const context = childTurnContext();
+
+    // 4. A record over the bound is refused before the boundary, terminated or not.
+    // The bound is 64 MiB: native compaction records already exceed 10 MiB and keep growing.
+    put(lines(sessionMeta, context, JSON.stringify(filler(17 * 1024 * 1024)), proof, taskStarted()));
+    expect(store.resolve(request).cwd).toBe(root);
+    const oversized = JSON.stringify(filler(64 * 1024 * 1024 + 1));
+    put(lines(sessionMeta, context, oversized, proof, taskStarted()));
+    expect(() => store.resolve(request)).toThrow("exceeds the bounded record size");
+    put(lines(sessionMeta, context, proof, oversized.slice(0, -2)), false);
+    expect(() => store.resolve(request)).toThrow("exceeds the bounded record size");
+
+    // 5. A boundary that was never completed is not a boundary.
+    put(lines(sessionMeta, context, proof, taskStarted()), false);
+    expect(() => store.resolve(request)).toThrow("no current task boundary for environment history");
+    put(lines(sessionMeta, context, proof, taskStarted()));
+    expect(store.resolve(request).cwd).toBe(root);
+
+    // 6. Damage in a record that carries the claimed message or a task boundary is never skipped.
+    put(lines(sessionMeta, context, proof.slice(0, -1), taskStarted()));
+    expect(() => store.resolve(request)).toThrow("invalid complete JSONL record");
+    put(lines(sessionMeta, context, proof, `${JSON.stringify(taskStarted()).slice(0, -1)}`, taskStarted()));
+    expect(() => store.resolve(request)).toThrow("invalid complete JSONL record");
+    // Damage in a record that can neither prove nor bound the claim does not block the task.
+    // (It sits before the turn context so that the backwards authority lookup never reaches it.)
+    put(lines(sessionMeta, "{\"type\":\"response_item\",\"payload\":{\"type\":\"reasoning\"", context, proof, taskStarted()));
+    expect(store.resolve(request).cwd).toBe(root);
   });
 
   test("root rollout lookup authenticates the indexed owner and current sandbox", () => {

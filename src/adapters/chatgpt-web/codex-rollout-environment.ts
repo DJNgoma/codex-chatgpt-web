@@ -42,7 +42,10 @@ export interface CodexRolloutEnvironment {
 const CODEX_ID_SOURCE = "[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
 const CODEX_ID = new RegExp(`^${CODEX_ID_SOURCE}$`, "i");
 const ROLLOUT_READ_CHUNK_BYTES = 64 * 1024;
-const MAX_ROLLOUT_JSON_LINE_BYTES = 16 * 1024 * 1024;
+// Native compaction records carry the whole retained history in one line. They already exceed
+// 10 MiB on long tasks and grow with the task, and a single record over the bound fails every
+// later verification of that thread. The bound only limits memory for a damaged file.
+const MAX_ROLLOUT_JSON_LINE_BYTES = 64 * 1024 * 1024;
 const MAX_ROLLOUT_DIRECTORY_ENTRIES = 100_000;
 
 type IndexedRollout =
@@ -190,6 +193,54 @@ function parseJsonLine(line: Buffer): Record<string, unknown> {
   }
 }
 
+const TASK_STARTED_BYTES = Buffer.from("task_started");
+
+/**
+ * Visit every complete rollout record in file order; return true from `visit` to stop.
+ *
+ * Rollouts reach gigabytes and single records reach megabytes. A record that spans read chunks
+ * is kept as pieces and joined once, so its cost is one copy rather than one per chunk. The
+ * record passed to `visit` may alias the read buffer and is only valid during that call. An
+ * unterminated final record is never visited: Codex has not finished writing it.
+ */
+function forEachRolloutRecord(
+  fd: number,
+  size: number,
+  changedMessage: string,
+  visit: (line: Buffer) => boolean | void,
+): void {
+  const buffer = Buffer.allocUnsafe(ROLLOUT_READ_CHUNK_BYTES);
+  let pieces: Buffer[] = [];
+  let pendingBytes = 0;
+  let position = 0;
+  while (position < size) {
+    const length = Math.min(ROLLOUT_READ_CHUNK_BYTES, size - position);
+    if (readSync(fd, buffer, 0, length, position) !== length) throw new Error(changedMessage);
+    position += length;
+    const data = buffer.subarray(0, length);
+    let start = 0;
+    for (let end = data.indexOf(0x0a); end >= 0; end = data.indexOf(0x0a, start)) {
+      let line = data.subarray(start, end);
+      start = end + 1;
+      if (pendingBytes > 0) {
+        pieces.push(line);
+        line = Buffer.concat(pieces, pendingBytes + line.length);
+        pieces = [];
+        pendingBytes = 0;
+      }
+      if (!line.length) continue;
+      if (line.length > MAX_ROLLOUT_JSON_LINE_BYTES) throw new Error("Codex rollout JSONL record exceeds the bounded record size");
+      if (visit(line) === true) return;
+    }
+    if (start < length) {
+      // The read buffer is reused, so the unfinished tail has to be copied out of it.
+      pieces.push(Buffer.from(data.subarray(start)));
+      pendingBytes += length - start;
+      if (pendingBytes > MAX_ROLLOUT_JSON_LINE_BYTES) throw new Error("Codex rollout JSONL record exceeds the bounded record size");
+    }
+  }
+}
+
 function firstRolloutRecord(fd: number, size: number): Record<string, unknown> {
   let position = 0;
   let buffered = Buffer.alloc(0);
@@ -216,25 +267,32 @@ function latestRolloutPayload(
   matches: (payload: Record<string, unknown> | undefined) => boolean = () => true,
 ): Record<string, unknown> | undefined {
   let position = size;
-  let carry = Buffer.alloc(0);
+  // The part of the record being assembled that lies in later chunks, newest piece first.
+  // Joining once per record keeps a multi-megabyte line at one copy instead of one per chunk.
+  let later: Buffer[] = [];
+  let laterBytes = 0;
   let firstSegmentAtEof = true;
   const fileEndsWithNewline = (() => {
     if (size === 0) return false;
     const byte = Buffer.alloc(1);
     return readSync(fd, byte, 0, 1, size - 1) === 1 && byte[0] === 0x0a;
   })();
+  const chunk = Buffer.allocUnsafe(ROLLOUT_READ_CHUNK_BYTES);
 
   while (position > 0) {
     const length = Math.min(ROLLOUT_READ_CHUNK_BYTES, position);
     position -= length;
-    const chunk = Buffer.alloc(length);
     const count = readSync(fd, chunk, 0, length, position);
     if (count !== length) throw new Error("Codex rollout changed during authority lookup");
-    const data = Buffer.concat([chunk, carry]);
-    let lineEnd = data.length;
-    for (let index = data.length - 1; index >= 0; index -= 1) {
-      if (data[index] !== 0x0a) continue;
-      const line = data.subarray(index + 1, lineEnd);
+    let lineEnd = length;
+    for (let index = length - 1; index >= 0; index -= 1) {
+      if (chunk[index] !== 0x0a) continue;
+      let line = chunk.subarray(index + 1, lineEnd);
+      if (laterBytes > 0) {
+        line = Buffer.concat([line, ...later.reverse()], line.length + laterBytes);
+        later = [];
+        laterBytes = 0;
+      }
       const trailingPartial = firstSegmentAtEof && !fileEndsWithNewline;
       firstSegmentAtEof = false;
       lineEnd = index;
@@ -245,13 +303,17 @@ function latestRolloutPayload(
       const item = parseJsonLine(line);
       if (item.type === type && matches(record(item.payload))) return record(item.payload);
     }
-    carry = Buffer.from(data.subarray(0, lineEnd));
-    if (carry.length > MAX_ROLLOUT_JSON_LINE_BYTES) {
-      throw new Error("Codex rollout JSONL record exceeds the bounded record size");
+    if (lineEnd > 0) {
+      // The read buffer is reused, so the unfinished head has to be copied out of it.
+      later.push(Buffer.from(chunk.subarray(0, lineEnd)));
+      laterBytes += lineEnd;
+      if (laterBytes > MAX_ROLLOUT_JSON_LINE_BYTES) {
+        throw new Error("Codex rollout JSONL record exceeds the bounded record size");
+      }
     }
   }
-  if (carry.length === 0) return undefined;
-  const item = parseJsonLine(carry);
+  if (laterBytes === 0) return undefined;
+  const item = parseJsonLine(Buffer.concat(later.reverse(), laterBytes));
   return item.type === type && matches(record(item.payload)) ? record(item.payload) : undefined;
 }
 
@@ -297,46 +359,37 @@ function verifyCurrentCalendarPreamble(fd: number, size: number, turnId: string,
   let currentTask = false;
   let matched = false;
   let calendarMatched = false;
-  let position = 0;
-  let carry = Buffer.alloc(0);
-  while (position < size) {
-    const length = Math.min(ROLLOUT_READ_CHUNK_BYTES, size - position);
-    const chunk = Buffer.alloc(length);
-    if (readSync(fd, chunk, 0, length, position) !== length) throw new Error("Codex rollout changed during calendar preamble lookup");
-    position += length;
-    const data = Buffer.concat([carry, chunk]);
-    let start = 0;
-    for (let end = data.indexOf(0x0a); end >= 0; end = data.indexOf(0x0a, start)) {
-      const line = data.subarray(start, end);
-      start = end + 1;
-      if (!line.length) continue;
-      if (line.length > MAX_ROLLOUT_JSON_LINE_BYTES) throw new Error("Codex rollout JSONL record exceeds the bounded record size");
-      const item = parseJsonLine(line);
-      const payload = record(item.payload);
-      if (item.type === "event_msg" && payload?.type === "task_started") {
-        currentTask = payload.turn_id === turnId;
-        matched = false;
-        calendarMatched = false;
-      }
-      if (!currentTask) continue;
-      if (item.type === "response_item" && payload?.id === message.id) {
-        if (matched || payload.type !== "message" || payload.role !== "user"
-          || !isDeepStrictEqual(payload.content, message.content)) throw new Error("Calendar preamble differs from its native Codex record");
-        matched = true;
-      }
-      if (item.type === "world_state" && matched && payload?.full === true) {
-        const calendar = record(record(payload.state)?.environments);
-        calendarMatched = calendar?.current_date === message.currentDate && calendar?.timezone === message.timezone;
-      }
-      if (item.type === "turn_context") {
-        if (payload?.turn_id === turnId && matched && calendarMatched) return;
-        throw new Error("Codex rollout does not authenticate the current calendar preamble");
-      }
+  let authenticated = false;
+  forEachRolloutRecord(fd, size, "Codex rollout changed during calendar preamble lookup", line => {
+    // Outside the task only a task boundary changes anything, and every boundary names itself.
+    // Skipping the rest spares parsing the megabyte records that make up most of a long rollout.
+    if (!currentTask && !line.includes(TASK_STARTED_BYTES)) return;
+    const item = parseJsonLine(line);
+    const payload = record(item.payload);
+    if (item.type === "event_msg" && payload?.type === "task_started") {
+      currentTask = payload.turn_id === turnId;
+      matched = false;
+      calendarMatched = false;
     }
-    carry = Buffer.from(data.subarray(start));
-    if (carry.length > MAX_ROLLOUT_JSON_LINE_BYTES) throw new Error("Codex rollout JSONL record exceeds the bounded record size");
-  }
-  throw new Error("Codex rollout does not authenticate the current calendar preamble");
+    if (!currentTask) return;
+    if (item.type === "response_item" && payload?.id === message.id) {
+      if (matched || payload.type !== "message" || payload.role !== "user"
+        || !isDeepStrictEqual(payload.content, message.content)) throw new Error("Calendar preamble differs from its native Codex record");
+      matched = true;
+    }
+    if (item.type === "world_state" && matched && payload?.full === true) {
+      const calendar = record(record(payload.state)?.environments);
+      calendarMatched = calendar?.current_date === message.currentDate && calendar?.timezone === message.timezone;
+    }
+    if (item.type === "turn_context") {
+      if (payload?.turn_id === turnId && matched && calendarMatched) {
+        authenticated = true;
+        return true;
+      }
+      throw new Error("Codex rollout does not authenticate the current calendar preamble");
+    }
+  });
+  if (!authenticated) throw new Error("Codex rollout does not authenticate the current calendar preamble");
 }
 
 /** One native user message with this id and exactly this content, or no proof at all. */
@@ -368,72 +421,66 @@ function verifyHistoricalEnvironmentMessages(
 ): ChatGptUnattributedEnvironmentMessage[] {
   const pending = new Map(messages.map(message => [message.id, message.content]));
   if (pending.size !== messages.length) throw new Error("Codex environment history repeats a message id");
+  // A record can prove or contradict a claim only if it carries that message id, and a task
+  // boundary always names itself. Before the boundary nothing else is parsed: most of a long
+  // rollout is megabyte compaction records about other messages. A record whose id is escaped
+  // or damaged simply proves nothing, which rejects the claim.
+  const claimedIds = messages.map(message => Buffer.from(message.id));
   let currentTask = false;
+  let historical = false;
   let superseded = false;
   let rebuilt: Set<string> | undefined;
-  let position = 0;
-  let carry = Buffer.alloc(0);
-  scan: while (position < size) {
-    const length = Math.min(ROLLOUT_READ_CHUNK_BYTES, size - position);
-    const chunk = Buffer.alloc(length);
-    if (readSync(fd, chunk, 0, length, position) !== length) {
-      throw new Error("Codex rollout changed during environment history lookup");
-    }
-    position += length;
-    const data = Buffer.concat([carry, chunk]);
-    let start = 0;
-    for (let end = data.indexOf(0x0a); end >= 0; end = data.indexOf(0x0a, start)) {
-      const line = data.subarray(start, end);
-      start = end + 1;
-      if (!line.length) continue;
-      if (line.length > MAX_ROLLOUT_JSON_LINE_BYTES) throw new Error("Codex rollout JSONL record exceeds the bounded record size");
-      const item = parseJsonLine(line);
-      const payload = record(item.payload);
-      if (currentTask) {
-        // Past the boundary only this task's own compaction can prove anything. A later task
-        // boundary means the request does not describe the latest native task at all.
-        if (item.type === "event_msg" && payload?.type === "task_started") {
-          superseded = true;
-          break scan;
-        }
-        if (item.type === "compacted") {
-          // Each compaction replaces the history Codex replays, so only the latest one counts.
-          rebuilt = new Set([...pending].filter(([id, content]) =>
-            replacementHistoryProves(payload?.replacement_history, id, content)).map(([id]) => id));
-        }
-        continue;
-      }
-      // Core writes task_started before this turn's environment update. Merely finding matching
-      // XML somewhere in the file would also accept a current update as historical.
-      if (item.type === "event_msg" && payload?.type === "task_started" && payload.turn_id === turnId) {
-        if (pending.size === 0) return [];
-        if (!options.allowCurrentCompaction) {
-          throw new Error("Codex rollout does not authenticate the historical environment messages");
-        }
-        currentTask = true;
-        continue;
+  forEachRolloutRecord(fd, size, "Codex rollout changed during environment history lookup", line => {
+    if (!currentTask && !line.includes(TASK_STARTED_BYTES) && !claimedIds.some(id => line.includes(id))) return;
+    const item = parseJsonLine(line);
+    const payload = record(item.payload);
+    if (currentTask) {
+      // Past the boundary only this task's own compaction can prove anything. A later task
+      // boundary means the request does not describe the latest native task at all.
+      if (item.type === "event_msg" && payload?.type === "task_started") {
+        superseded = true;
+        return true;
       }
       if (item.type === "compacted") {
-        for (const [id, content] of pending) {
-          if (replacementHistoryProves(payload?.replacement_history, id, content)) pending.delete(id);
-        }
-        continue;
+        // Each compaction replaces the history Codex replays, so only the latest one counts.
+        rebuilt = new Set([...pending].filter(([id, content]) =>
+          replacementHistoryProves(payload?.replacement_history, id, content)).map(([id]) => id));
       }
-      if (item.type !== "response_item" || payload?.type !== "message" || payload.role !== "user"
-        || typeof payload.id !== "string" || !pending.has(payload.id)) continue;
-      if (!isDeepStrictEqual(payload.content, pending.get(payload.id))) {
-        throw new Error("Historical environment message differs from its native Codex record");
-      }
-      pending.delete(payload.id);
+      return;
     }
-    carry = Buffer.from(data.subarray(start));
-    if (carry.length > MAX_ROLLOUT_JSON_LINE_BYTES) throw new Error("Codex rollout JSONL record exceeds the bounded record size");
-  }
+    // Core writes task_started before this turn's environment update. Merely finding matching
+    // XML somewhere in the file would also accept a current update as historical.
+    if (item.type === "event_msg" && payload?.type === "task_started" && payload.turn_id === turnId) {
+      if (pending.size === 0) {
+        historical = true;
+        return true;
+      }
+      if (!options.allowCurrentCompaction) {
+        throw new Error("Codex rollout does not authenticate the historical environment messages");
+      }
+      currentTask = true;
+      return;
+    }
+    if (item.type === "compacted") {
+      for (const [id, content] of pending) {
+        if (replacementHistoryProves(payload?.replacement_history, id, content)) pending.delete(id);
+      }
+      return;
+    }
+    if (item.type !== "response_item" || payload?.type !== "message" || payload.role !== "user"
+      || typeof payload.id !== "string" || !pending.has(payload.id)) return;
+    if (!isDeepStrictEqual(payload.content, pending.get(payload.id))) {
+      throw new Error("Historical environment message differs from its native Codex record");
+    }
+    pending.delete(payload.id);
+  });
+  if (historical) return [];
   if (!currentTask) throw new Error("Codex rollout has no current task boundary for environment history");
   if (superseded || !rebuilt || rebuilt.size !== pending.size) {
     throw new Error("Codex rollout does not authenticate the historical environment messages");
   }
-  return messages.filter(message => rebuilt.has(message.id));
+  const proven = rebuilt;
+  return messages.filter(message => proven.has(message.id));
 }
 
 function validateSessionMeta(
