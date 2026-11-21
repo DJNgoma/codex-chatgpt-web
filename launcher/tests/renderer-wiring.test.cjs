@@ -359,6 +359,8 @@ test("catalog verification reports a failed request instead of requesting anothe
   let payload = { pid: 10, successful_model_catalog_requests: 0, model_catalog_requests: 0, last_model_catalog_result: null };
   vm.runInNewContext(source + "\nstartCatalogVerificationMonitor({ logger, stateStore });", {
     catalogVerificationInFlight: false, catalogVerificationTimer: null, lastOperation: null,
+    LAUNCHER_PROFILE: { codexHome: "/unused" },
+    inspectCodexModelPicker: () => ({ source: "bridge", readable: true, models: [] }),
     stopCatalogVerificationMonitor() {},
     runtimeSupervisor: { readConfig: () => ({}), proxyHealthPayload: async () => payload },
     stateStore: { read: () => state, update: patch => Object.assign(state, patch) },

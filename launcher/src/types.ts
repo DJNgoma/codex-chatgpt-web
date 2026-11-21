@@ -24,6 +24,7 @@ export interface LauncherState {
   browserSmokeVersion?: string | null;
   coreSetupComplete?: boolean;
   codexCatalogVerified?: boolean;
+  codexCatalogVerificationSource?: "codex-request" | "external-model-catalog" | null;
   mcpSetupComplete?: boolean;
   mcpRuntimeInstalled?: boolean;
   codexRestartRequired?: boolean;

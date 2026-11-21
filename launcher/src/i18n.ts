@@ -1,6 +1,9 @@
 import type { Language } from "./types";
 
 const en = {
+  externalModelsInstalled: "Already configured",
+  externalModelsBody: "Your existing Codex catalogue supplies the ChatGPT Web models. Keep managing those models through your current provider.",
+  externalCatalogNotice: "Models found in your custom catalogue. You can configure MCP now. A completed Web model turn is still needed to verify the connection; reinstalling or restarting will not perform that check.",
   product: "Codex Web GPT",
   devBadge: "DEV",
   devSetupTitle: "Set up the isolated DEV profile",
@@ -203,6 +206,9 @@ const en = {
 } as const;
 
 const zh: Record<keyof typeof en, string> = {
+  externalModelsInstalled: "已配置",
+  externalModelsBody: "现有 Codex 模型目录已提供 ChatGPT Web 模型。请继续通过当前提供商管理这些模型。",
+  externalCatalogNotice: "已在自定义目录中找到模型，现在可以配置 MCP。仍需完成一次 Web 模型对话以验证连接；重新安装或重启无法完成此检查。",
   product: "Codex Web GPT",
   devBadge: "DEV",
   devSetupTitle: "设置隔离的 DEV 配置",
@@ -405,6 +411,9 @@ const zh: Record<keyof typeof en, string> = {
 };
 
 const ja: Record<keyof typeof en, string> = {
+  externalModelsInstalled: "設定済み",
+  externalModelsBody: "既存の Codex カタログに ChatGPT Web モデルがあります。モデルは現在のプロバイダーで管理してください。",
+  externalCatalogNotice: "カスタムカタログにモデルが見つかりました。MCP を設定できます。接続の確認には Web モデルでの応答の完了が必要です。再インストールや再起動では確認できません。",
   product: "Codex Web GPT",
   devBadge: "DEV",
   devSetupTitle: "隔離された DEV プロファイルをセットアップ",
@@ -607,6 +616,9 @@ const ja: Record<keyof typeof en, string> = {
 };
 
 const ko: Record<keyof typeof en, string> = {
+  externalModelsInstalled: "이미 구성됨",
+  externalModelsBody: "기존 Codex 카탈로그에 ChatGPT Web 모델이 있습니다. 현재 제공업체를 통해 모델을 관리하세요.",
+  externalCatalogNotice: "사용자 지정 카탈로그에서 모델을 찾았습니다. MCP를 구성할 수 있습니다. 연결 확인에는 Web 모델 응답 완료가 필요하며 재설치나 재시작으로는 확인되지 않습니다.",
   product: "Codex Web GPT",
   devBadge: "DEV",
   devSetupTitle: "격리된 DEV 프로필 설정",
@@ -809,6 +821,9 @@ const ko: Record<keyof typeof en, string> = {
 };
 
 const zhTW: Record<keyof typeof en, string> = {
+  externalModelsInstalled: "已設定",
+  externalModelsBody: "現有 Codex 模型目錄已提供 ChatGPT Web 模型。請繼續透過目前的提供者管理這些模型。",
+  externalCatalogNotice: "已在自訂目錄中找到模型，現在可以設定 MCP。仍需完成一次 Web 模型對話以驗證連線；重新安裝或重新啟動無法完成此檢查。",
   product: "Codex Web GPT",
   devBadge: "DEV",
   devSetupTitle: "設定隔離的 DEV 設定檔",

@@ -1097,6 +1097,8 @@ function SetupSurface({
   updateState: (state: LauncherState) => void;
 }) {
   const [localBusy, setLocalBusy] = useState(false);
+  const externalCatalog = !devProfile && snapshot.state.codexCatalogVerified === true
+    && snapshot.state.codexCatalogVerificationSource === "external-model-catalog";
   const manualInteraction = snapshot.state.browserInteractionMode === "manual";
   const busy = localBusy
     || operation?.status === "running"
@@ -1168,12 +1170,12 @@ function SetupSurface({
           />
         </> : null}
         <SetupRow
-          action={snapshot.state.coreSetupComplete
+          action={externalCatalog ? copy.externalModelsInstalled : snapshot.state.coreSetupComplete
             ? devProfile ? copy.devReinstall : copy.reinstall
             : devProfile ? copy.devInstall : copy.install}
           complete={snapshot.state.codexCatalogVerified === true}
-          description={devProfile ? copy.devStepInstallBody : copy.stepInstallBody}
-          disabled={busy || (!snapshot.smokePassed && snapshot.state.coreSetupComplete !== true)}
+          description={externalCatalog ? copy.externalModelsBody : devProfile ? copy.devStepInstallBody : copy.stepInstallBody}
+          disabled={externalCatalog || busy || (!snapshot.smokePassed && snapshot.state.coreSetupComplete !== true)}
           index={manualInteraction ? 1 : 3}
           onAction={install}
           repeatable
@@ -1189,7 +1191,9 @@ function SetupSurface({
         />
       </div>
 
-      {!devProfile && snapshot.state.codexRestartRequired ? (
+      {externalCatalog ? (
+        <NoticeRow icon="info" tone="warning">{copy.externalCatalogNotice}</NoticeRow>
+      ) : !devProfile && snapshot.state.codexRestartRequired ? (
         <NoticeRow icon="alert" tone="warning">
           {copy.restartCodex}
         </NoticeRow>
@@ -1729,7 +1733,9 @@ function SettingsSurface({
         </SettingRow>
       </div>
 
-      {!devProfile && snapshot.state.codexRestartRequired ? (
+      {!devProfile && snapshot.state.codexRestartRequired
+        && !(snapshot.state.codexCatalogVerified === true
+          && snapshot.state.codexCatalogVerificationSource === "external-model-catalog") ? (
         <NoticeRow icon="alert" tone="warning">
           {copy.restartCodex}
         </NoticeRow>

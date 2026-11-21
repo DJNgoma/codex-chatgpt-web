@@ -31,6 +31,8 @@ const { ensurePackagedRuntime, waitForPackagedRuntimeSource } = require("./runti
 const { RuntimeSupervisor } = require("./runtime-supervisor.cjs");
 const { DEVELOPMENT_PROFILE, resolveLauncherProfile } = require("./profile.cjs");
 const { runtimeBundlePaths } = require("./runtime-command.cjs");
+const { inspectCodexModelPicker } = require("./codex-catalog-route.cjs");
+const { catalogVerificationPatch } = require("./catalog-verification.cjs");
 const { createUpdateController } = require("./update.cjs");
 const {
   createStateStore,
@@ -133,13 +135,39 @@ function startCatalogVerificationMonitor({ logger, stateStore }) {
   let reportedFailure = null;
   const check = async () => {
     const current = stateStore.read();
-    if (current.coreSetupComplete !== true || current.codexCatalogVerified === true) {
+    if (current.coreSetupComplete !== true) {
       stopCatalogVerificationMonitor();
       return;
     }
     if (catalogVerificationInFlight || !runtimeSupervisor) return;
     catalogVerificationInFlight = true;
     try {
+      const picker = inspectCodexModelPicker(LAUNCHER_PROFILE.codexHome);
+      if (picker.source !== "bridge") {
+        // A pinned catalogue never requests /v1/models. Inspect the actual file;
+        // do not manufacture request evidence or claim Codex has restarted.
+        const patch = catalogVerificationPatch(current, picker, null) || {
+          codexCatalogVerified: false,
+          codexCatalogVerificationSource: "external-model-catalog",
+        };
+        if (Object.entries(patch).some(([key, value]) => current[key] !== value)) {
+          const state = stateStore.update(patch);
+          logger.info("codex.external_catalog_checked", {
+            available: patch.codexCatalogVerified, models: picker.models.length,
+            runtimeVerified: false, error: picker.error,
+          });
+          send("launcher:state-changed", state);
+        }
+        // Keep checking: removal or replacement must revoke the catalogue gate.
+        return;
+      }
+      if (current.codexCatalogVerificationSource === "external-model-catalog") {
+        const state = stateStore.update({ codexCatalogVerified: false, codexCatalogVerificationSource: null });
+        send("launcher:state-changed", state);
+      } else if (current.codexCatalogVerified === true) {
+        stopCatalogVerificationMonitor();
+        return;
+      }
       const config = runtimeSupervisor.readConfig();
       const health = await runtimeSupervisor.proxyHealthPayload(config);
       if (!Number.isInteger(health?.successful_model_catalog_requests)
@@ -165,6 +193,7 @@ function startCatalogVerificationMonitor({ logger, stateStore }) {
       }
       const state = stateStore.update({
         codexCatalogVerified: true,
+        codexCatalogVerificationSource: "codex-request",
         codexRestartRequired: false,
       });
       logger.info("codex.model_catalog_verified", {
@@ -736,6 +765,16 @@ function registerIpc({ logger, stateStore }) {
   });
   handle("launcher:setup-core", async () => {
     const setupState = stateStore.read();
+    if (!IS_DEV_PROFILE && setupState.coreSetupComplete === true) {
+      const picker = inspectCodexModelPicker(LAUNCHER_PROFILE.codexHome);
+      const patch = picker.source === "external" && catalogVerificationPatch(setupState, picker, null);
+      if (patch) {
+        const state = stateStore.update(patch);
+        send("launcher:state-changed", state);
+        startCatalogVerificationMonitor({ logger, stateStore });
+        return { ok: true, stdout: "ChatGPT Web models are already configured in the external catalogue.", restartRequired: false };
+      }
+    }
     if (setupState.browserInteractionMode === "automatic") {
       const browser = await browserHost.probeAuthentication();
       if (!browser.authenticated) {
@@ -1026,6 +1065,9 @@ async function start() {
     stateStore.update({ sessionRefreshReminderAt: nextSessionRefreshReminderAt() });
   }
   const persistedState = stateStore.read();
+  if (persistedState.codexCatalogVerificationSource === "external-model-catalog") {
+    stateStore.update({ codexCatalogVerified: false });
+  }
   if (persistedState.coreSetupComplete === true && persistedState.codexCatalogVerified === undefined) {
     stateStore.update({
       coreSetupComplete: false,
