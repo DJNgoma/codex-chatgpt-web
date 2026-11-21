@@ -113,8 +113,19 @@ Activated with `repair-evidence/activate-reviewed-r3.py`.
 
 An independent read of the whole local patch set found no fail-open path and no
 blocking defect in the authentication changes. It did find the items below.
-Three commits follow build r3 and are **not installed yet**. They need a full
-package build because one of them changes the launcher's ASAR.
+Three commits follow build r3 and are **not installed yet**. They are packaged
+as build r4, which is prepared and waits for the launcher to be idle:
+
+- Candidate: `launcher/build/reviewed-6.1.19-r4/mac-arm64/Codex Web GPT.app`
+- ASAR SHA-256:
+  `78602f6adcf8fb3927fcde44154a1626d066352b42b956da23d9ec4cca1f4284`.
+  Two of its 1,063 files differ from the installed ASAR:
+  `electron/catalog-verification.cjs` and `electron/codex-catalog-route.cjs`.
+- Runtime CLI SHA-256:
+  `a8feb056c94b7777648dde9f263ffb24fe1e601acba8cac6d1cfab0699e70411`
+- Activate from the checkout root with
+  `python3 repair-evidence/activate-reviewed-r4.py`, then tag the commit
+  `local-build/6.1.19-r4`.
 
 Changed:
 
