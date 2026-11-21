@@ -1,5 +1,24 @@
 # Codex Web GPT 6.1.19 local provider update
 
+## Where this lives
+
+This is branch `codex/local-provider-6.1.19` of the personal fork
+`DJNgoma/codex-chatgpt-web`. It is the build installed at
+`/Applications/Codex Web GPT.app`. The only working copy is
+`~/Developer/codex-chatgpt-web`. The per-version sibling folders were
+consolidated into it on 21 November 2026.
+
+The branch map, the list of local fixes and the steps for taking a new upstream
+release are in `FORK_WORKFLOW.md` on `main`. Read it without switching branch:
+
+```sh
+git show main:FORK_WORKFLOW.md
+```
+
+Private evidence for this build is in `repair-evidence/`. Earlier versions are
+in `repair-evidence/archive/`. That directory is local only and is never
+committed.
+
 This local build is based on upstream v6.1.19, commit
 `8e9fac038dcd998bf23716df2b08379a15854ec9`. It carries forward the provider
 and current-turn calendar fixes from the reviewed 6.1.18 build. Upstream
