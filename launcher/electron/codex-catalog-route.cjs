@@ -129,7 +129,7 @@ function inspectCodexModelPicker(codexHome) {
 // catalog that happens to exist proves nothing on its own: this bridge does not write into one.
 function externalCatalogListsChatGptWebModels(codexHome) {
   const picker = inspectCodexModelPicker(codexHome);
-  return picker.source === "external" && picker.models.length > 0;
+  return picker.source === "external" && picker.models.some(model => model.visible);
 }
 
 module.exports = {

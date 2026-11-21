@@ -108,6 +108,19 @@ test("an external catalog reports the ChatGPT Web models it lists and their visi
   assert.equal(externalCatalogListsChatGptWebModels(dir), true);
 });
 
+test("an external catalog whose ChatGPT Web models are all hidden does not list them in the picker", () => {
+  const { dir } = catalogHome(
+    'model_catalog_json = "__CATALOG__"\n',
+    JSON.stringify({ models: [
+      { slug: "chatgpt-web-pro", display_name: "ChatGPT Web", visibility: "hide" },
+      { slug: "chatgpt-web-high", display_name: "ChatGPT Web High", visibility: "hide" },
+    ] }),
+  );
+  // The inspection still reports them, so the UI can say they are installed but hidden.
+  assert.deepEqual(inspectCodexModelPicker(dir).models.map(model => model.visible), [false, false]);
+  assert.equal(externalCatalogListsChatGptWebModels(dir), false);
+});
+
 test("an external catalog without ChatGPT Web models is not evidence that the picker has them", () => {
   const { dir } = catalogHome(
     'model_catalog_json = "__CATALOG__"\n',

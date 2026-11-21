@@ -44,6 +44,17 @@ test("missing routes, invalid configs and empty catalogues cannot unlock setup",
   assert.equal(catalogVerificationPatch(pending, { ...bridge, source: "unknown" }, { successful_model_catalog_requests: 1 }), null);
 });
 
+// The picker shows only visible rows. A catalogue whose Web entries are all hidden lists nothing
+// the user can select, so it must not unlock the gate; one visible row among hidden ones does.
+test("hidden-only external catalogue entries cannot unlock setup", () => {
+  const hidden = { slug: "chatgpt-web-pro", displayName: "ChatGPT Web", visible: false };
+  const shown = { slug: "chatgpt-web-6-pro", displayName: "ChatGPT Web 6 Pro", visible: true };
+  assert.equal(catalogVerificationPatch(pending, { ...external, models: [hidden] }, null), null);
+  assert.equal(catalogVerificationPatch(pending, { ...external, models: [hidden, hidden] }, { successful_model_catalog_requests: 2 }), null);
+  assert.deepEqual(catalogVerificationPatch(pending, { ...external, models: [hidden, shown] }, null),
+    { codexCatalogVerified: true, codexCatalogVerificationSource: "external-model-catalog" });
+});
+
 test("ambiguous legacy verification is rechecked once without changing installed route state", () => {
   assert.deepEqual(legacyCatalogVerificationPatch({ ...pending, codexCatalogVerified: true, codexRestartRequired: false }), {
     codexCatalogVerified: false, codexRestartRequired: true,
